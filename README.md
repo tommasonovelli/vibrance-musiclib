@@ -57,7 +57,7 @@ To do it, follow [The data in a host folder](docs/operations.md#the-data-in-a-ho
 Paste this block into a terminal. It creates `~/musiclib`, downloads the two files of the latest release, writes a random database password and a random sign-in password into `.env`, and starts MusicLib:
 
 ```sh
-mkdir -p ~/musiclib/import && cd ~/musiclib
+mkdir -p ~/vibrance/import && cd ~/vibrance
 [ -e compose.yaml ] || curl -fsSLO https://github.com/tommasonovelli/vibrance-musiclib/releases/latest/download/compose.yaml
 [ -e .env ] || { curl -fsSL -o .env https://github.com/tommasonovelli/vibrance-musiclib/releases/latest/download/env.example && chmod 600 .env && sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$(openssl rand -hex 32)/" .env && sed -i "s|^MUSICLIB_PASSWORD=.*|MUSICLIB_PASSWORD=$(openssl rand -base64 24)|" .env; }
 docker compose up -d --wait
