@@ -29,7 +29,7 @@ maintenance_run() {
 
 # maintenance_check_folder <command...>: refuses, before anything is stopped,
 # when the app or postgres container of this clone's Compose project was
-# created in another folder. A clone next to an installation (~/musiclib) has
+# created in another folder. A clone next to an installation (~/vibrance) has
 # the same project name, `musiclib`, but not that installation's .env: it
 # would stop the installation's app and run the command with the clone's
 # settings. Compose records the folder in a label of every container; `-ef`
@@ -63,7 +63,7 @@ maintenance_refuse_folder() {
     printf -v cd_line 'cd %q' "$folder"
   else
     why="a container of the Compose project of this clone (${REPO_ROOT}) does not record the folder it was created in: it may belong to another installation"
-    cd_line='cd ~/musiclib    # the folder of your compose.yaml and .env'
+    cd_line='cd ~/vibrance    # the folder of your compose.yaml and .env'
   fi
   printf -v args '%q ' "$@"
   case "$1" in

@@ -54,7 +54,7 @@ To do it, follow [The data in a host folder](docs/operations.md#the-data-in-a-ho
 
 ### 3. Install and start
 
-Paste this block into a terminal. It creates `~/musiclib`, downloads the two files of the latest release, writes a random database password and a random sign-in password into `.env`, and starts MusicLib:
+Paste this block into a terminal. It creates `~/vibrance`, downloads the two files of the latest release, writes a random database password and a random sign-in password into `.env`, and starts MusicLib:
 
 ```sh
 mkdir -p ~/vibrance/import && cd ~/vibrance
@@ -70,7 +70,7 @@ docker compose ps                                    # both containers show "hea
 curl -f http://127.0.0.1:8080/health/ready           # prints {"status":"ready"}
 ```
 
-- **Run every command of this README from `~/musiclib`** (`cd ~/musiclib`).
+- **Run every command of this README from `~/vibrance`** (`cd ~/vibrance`).
 - The block is safe to paste twice: it never replaces an existing `compose.yaml` or `.env`. What each line does: [First start](docs/operations.md#first-start).
 - `.env` holds both passwords: keep it private (the block makes it readable by you only).
 - If the app is reported unhealthy, `docker compose logs --tail=20 app` shows a line with a `code`: look it up in [Troubleshooting](docs/operations.md#troubleshooting).
@@ -91,7 +91,7 @@ On a machine without a desktop, open MusicLib from your computer through an SSH 
 
 Your settings are in `.env`. The defaults suit most people; these are the ones most often changed. **After changing `.env`, apply it** with `docker compose up -d --wait`: Compose recreates the containers whose settings changed, keeps your data, and returns when MusicLib is ready. (`docker compose restart` does not apply a change of `.env`.)
 
-- **Import from your music folder** (`MUSICLIB_IMPORT`, at any time). Instead of `~/musiclib/import`, import from the folder where your music already is. MusicLib mounts it **read-only** and never changes, moves or deletes anything in it. The folder must exist, and its files must be readable by uid 1000 (files readable by everyone are fine).
+- **Import from your music folder** (`MUSICLIB_IMPORT`, at any time). Instead of `~/vibrance/import`, import from the folder where your music already is. MusicLib mounts it **read-only** and never changes, moves or deletes anything in it. The folder must exist, and its files must be readable by uid 1000 (files readable by everyone are fine).
 
   ```sh
   sed -i '/^#\?MUSICLIB_IMPORT=/d' .env && echo 'MUSICLIB_IMPORT=/srv/music' >> .env
@@ -132,10 +132,10 @@ Every setting, with its default: [Configuration](docs/operations.md#configuratio
 
 ### 6. Import your first album
 
-1. Copy an album folder into the import folder, `~/musiclib/import` (or your `MUSICLIB_IMPORT` folder), for example:
+1. Copy an album folder into the import folder, `~/vibrance/import` (or your `MUSICLIB_IMPORT` folder), for example:
 
    ```sh
-   cp -r ~/Music/"Miles Davis - Kind of Blue" ~/musiclib/import/
+   cp -r ~/Music/"Miles Davis - Kind of Blue" ~/vibrance/import/
    ```
 
 2. In MusicLib, open the **Import** page and choose **Import everything in …**.
@@ -154,7 +154,7 @@ Other programs may read it, but **never write in it**: change metadata in MusicL
 
 ## Everyday use
 
-Run these from `~/musiclib`. More in [Everyday commands](docs/operations.md#everyday-commands).
+Run these from `~/vibrance`. More in [Everyday commands](docs/operations.md#everyday-commands).
 
 | Task | Command |
 |---|---|
@@ -183,7 +183,7 @@ A good result is `Backup completed: /backup/2026-09-29-2130`: a new folder, name
 ### Update to a new version
 
 ```sh
-cd ~/musiclib
+cd ~/vibrance
 docker compose stop app &&
 docker compose run --rm --no-deps app backup --to "/backup/before-update-$(date +%F-%H%M)" &&
 curl -fsSLO https://github.com/tommasonovelli/vibrance-musiclib/releases/latest/download/compose.yaml &&
@@ -196,7 +196,7 @@ The block backs up first, and updates nothing if the backup fails. `compose.yaml
 **Upgrading from 1.0.0?** 1.1.0 does not start without a sign-in password, and the `.env` of 1.0.0 has none. Add one **before** the update block:
 
 ```sh
-cd ~/musiclib
+cd ~/vibrance
 grep -q '^MUSICLIB_PASSWORD=.' .env || { sed -i '/^MUSICLIB_PASSWORD=/d' .env && printf '\nMUSICLIB_PASSWORD=%s\n' "$(openssl rand -base64 24)" >> .env; }
 grep MUSICLIB_PASSWORD .env
 ```

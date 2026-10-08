@@ -5,6 +5,10 @@ Versions follow [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Changed
+
+- The install block and the guides use the folder `~/vibrance` instead of `~/musiclib`. An existing installation keeps working where it is: run its commands from its own folder.
+
 ## [1.2.0] - 2026-10-01
 
 Upgrading from 1.1.0 needs no extra step: take the new `compose.yaml` and update as usual. The database schema does not change.

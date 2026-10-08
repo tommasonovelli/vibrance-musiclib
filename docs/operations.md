@@ -6,7 +6,7 @@ The examples use the same values everywhere, so you can copy them and change onl
 
 | Example | What it stands for |
 |---|---|
-| `~/musiclib` | the folder that holds `compose.yaml` and `.env`. Run every command of this guide from there (`cd ~/musiclib`). |
+| `~/vibrance` | the folder that holds `compose.yaml` and `.env`. Run every command of this guide from there (`cd ~/vibrance`). |
 | `/srv/musiclib/data` | a host folder for MusicLib's data, if you choose one |
 | `/mnt/backup/musiclib` | a host folder for backups, on another disk |
 | `192.168.1.20` | the machine's address on your home network |
@@ -63,7 +63,7 @@ MusicLib is published as a Docker image, `ghcr.io/tommasonovelli/musiclib`, for 
 Paste this block into a terminal:
 
 ```sh
-mkdir -p ~/musiclib/import && cd ~/musiclib
+mkdir -p ~/vibrance/import && cd ~/vibrance
 [ -e compose.yaml ] || curl -fsSLO https://github.com/tommasonovelli/vibrance-musiclib/releases/latest/download/compose.yaml
 [ -e .env ] || { curl -fsSL -o .env https://github.com/tommasonovelli/vibrance-musiclib/releases/latest/download/env.example && chmod 600 .env && sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$(openssl rand -hex 32)/" .env && sed -i "s|^MUSICLIB_PASSWORD=.*|MUSICLIB_PASSWORD=$(openssl rand -base64 24)|" .env; }
 docker compose up -d --wait
@@ -71,7 +71,7 @@ docker compose up -d --wait
 
 What each line does:
 
-1. Creates `~/musiclib` and the import folder `~/musiclib/import` in it, then enters `~/musiclib`.
+1. Creates `~/vibrance` and the import folder `~/vibrance/import` in it, then enters `~/vibrance`.
 2. Downloads `compose.yaml`, the description of the two containers, unless the folder already has one.
 3. Downloads `env.example` as `.env`, your settings file, unless the folder already has one. It makes `.env` readable by you only (`chmod 600`), then writes a random database password (`POSTGRES_PASSWORD`) and a random sign-in password (`MUSICLIB_PASSWORD`) into it, without printing them.
 4. Starts MusicLib. The first time, Docker downloads the images. The command returns when MusicLib reports that it is ready.
@@ -80,7 +80,7 @@ The block is safe to paste twice: it never replaces an existing `compose.yaml` o
 
 What the block creates:
 
-- in `~/musiclib`: `compose.yaml`, `.env` and the empty folder `import`;
+- in `~/vibrance`: `compose.yaml`, `.env` and the empty folder `import`;
 - in Docker: the containers `musiclib` (the app) and `musiclib-db` (PostgreSQL 17), and the volumes `musiclib_db` (the database), `musiclib_data` (the originals and the library) and `musiclib_backup` (backups).
 
 Check that it works:
@@ -114,7 +114,7 @@ mkdir -p import
 docker compose up -d --build --wait
 ```
 
-- `COMPOSE_FILE=compose.dev.yaml` in `.env` makes every plain `docker compose` command, and the [maintenance scripts](#the-maintenance-scripts), use the source build. Run every command of this guide from the clone's folder, `vibrance-musiclib`, instead of `~/musiclib`, and add `--build` where this guide runs `docker compose up -d --wait` after changing the sources.
+- `COMPOSE_FILE=compose.dev.yaml` in `.env` makes every plain `docker compose` command, and the [maintenance scripts](#the-maintenance-scripts), use the source build. Run every command of this guide from the clone's folder, `vibrance-musiclib`, instead of `~/vibrance`, and add `--build` where this guide runs `docker compose up -d --wait` after changing the sources.
 - The first build compiles the pinned tools and takes several minutes.
 - `compose.dev.yaml` has the same database password default as `compose.yaml`.
 - A source build and a published-image installation are the same Compose project, `musiclib`, with the same containers and volumes: on one machine they share the same data.
@@ -122,7 +122,7 @@ docker compose up -d --build --wait
 
 ### Everyday commands
 
-Run them from `~/musiclib` (from the clone's folder for a source build):
+Run them from `~/vibrance` (from the clone's folder for a source build):
 
 | Task | Command | Good result |
 |---|---|---|
@@ -158,7 +158,7 @@ Compose recreates the containers whose settings changed and keeps the volumes. E
 | `MUSICLIB_PORT` | `8080` | `8081` | The host port MusicLib listens on. Change the port in `PUBLIC_ORIGIN` with it. |
 | `MUSICLIB_DATA` | `data` (the named volume `musiclib_data`) | `/srv/musiclib/data` | Where MusicLib keeps its data (`/data` in the container): a named volume, or the absolute path of an empty ext4 folder owned by uid 1000. See [The data in a host folder](#the-data-in-a-host-folder). |
 | `MUSICLIB_BACKUP` | `backup` (the named volume `musiclib_backup`) | `/mnt/backup/musiclib` | Where backups go (`/backup` in the container): a named volume, or the absolute path of a folder owned by uid 1000, preferably on another disk, never inside the data folder. |
-| `MUSICLIB_IMPORT` | `./import` (`~/musiclib/import`) | `/srv/music` | The folder with the music to import, mounted read-only on `/import`. It must exist before MusicLib starts. |
+| `MUSICLIB_IMPORT` | `./import` (`~/vibrance/import`) | `/srv/music` | The folder with the music to import, mounted read-only on `/import`. It must exist before MusicLib starts. |
 | `MUSICLIB_UID`, `MUSICLIB_GID` | `1000`, `1000` | `1001`, `1001` | The user and group MusicLib runs as. Another value needs `MUSICLIB_DATA` and `MUSICLIB_BACKUP` as host folders owned by it, and `/import` readable by it. Never `0` (root): MusicLib refuses to run as root. |
 | `WORKERS` | empty: the number of CPUs, at least 1 and at most 4 | `2` | How many scans, imports and album updates run at once, 1 to 16. |
 | `COMPOSE_PROJECT_NAME` | `musiclib` (the `name:` of `compose.yaml`) | `musiclib-restore` | Compose's own setting: the project name, which prefixes the containers and volumes. Only for a [second installation](#restoring-next-to-an-existing-installation). |
@@ -195,7 +195,7 @@ Outside Compose, `DATABASE_URL` may be any PostgreSQL URI or pgx keyword/value c
 
 | Data | Where | Default |
 |---|---|---|
-| Your source music | the import folder (`MUSICLIB_IMPORT`), mounted read-only | `~/musiclib/import` |
+| Your source music | the import folder (`MUSICLIB_IMPORT`), mounted read-only | `~/vibrance/import` |
 | The catalog: names, edits, the work queue | the PostgreSQL database | the volume `musiclib_db` |
 | The originals: an unchanged copy of every imported or uploaded file | `originals/` in the data folder | the volume `musiclib_data` |
 | The generated library | `library/` in the data folder | the volume `musiclib_data` |
@@ -289,7 +289,7 @@ Create it yourself: if it does not exist, Docker creates it owned by root, and M
    ls /srv/musiclib/data                          # library  originals  work
    ```
 
-   If the music you want to import is not in `~/musiclib/import`, add `MUSICLIB_IMPORT=/srv/music` too. The import folder must exist, and its files must be readable by uid 1000 (files readable by everyone are fine).
+   If the music you want to import is not in `~/vibrance/import`, add `MUSICLIB_IMPORT=/srv/music` too. The import folder must exist, and its files must be readable by uid 1000 (files readable by everyone are fine).
 4. Your library is at `/srv/musiclib/data/library`.
 
 MusicLib keeps everything there: `originals/`, `library/`, `work/` and its marker files `.lock` and `.musiclib-store` (and `.maintenance` while a rebuild or restore runs). It never changes or deletes any other entry at the top of the folder, but it does not refuse a folder that already holds other files, so keeping it empty is up to you.
@@ -463,7 +463,7 @@ A public name needs a DNS record (`A`, and `AAAA` for IPv6) pointing `music.exam
    reverse_proxy 127.0.0.1:8080
    ```
 
-3. In `~/musiclib`, point MusicLib at the new address (the `.env` of the install block has this line) and apply it:
+3. In `~/vibrance`, point MusicLib at the new address (the `.env` of the install block has this line) and apply it:
 
    ```sh
    sed -i 's|^PUBLIC_ORIGIN=.*|PUBLIC_ORIGIN=https://music.example.com|' .env
@@ -582,10 +582,10 @@ Response compression is not needed. If you turn it on (Caddy's `encode`, nginx's
 
 ### Importing
 
-1. Copy your albums into the import folder, `~/musiclib/import` (or the folder of `MUSICLIB_IMPORT`). For example:
+1. Copy your albums into the import folder, `~/vibrance/import` (or the folder of `MUSICLIB_IMPORT`). For example:
 
    ```text
-   ~/musiclib/import/
+   ~/vibrance/import/
      Miles Davis - Kind of Blue/
        01 So What.flac
        02 Freddie Freeloader.flac
@@ -628,7 +628,7 @@ A backup is a folder with the database dump (`catalog.dump`), a copy of every or
 
 ### Making a backup
 
-MusicLib must be stopped while a backup runs; PostgreSQL keeps running. From `~/musiclib`:
+MusicLib must be stopped while a backup runs; PostgreSQL keeps running. From `~/vibrance`:
 
 ```sh
 docker compose stop app
@@ -693,12 +693,12 @@ A backup made before schema 3 (by a development version older than 1.0.0) restor
 
 ### Restoring next to an existing installation
 
-To restore on a machine that still runs an installation (to test a backup, for example), use a second folder with its own `compose.yaml` and `.env`, such as `~/musiclib-restore`: paste the install block without its last line, with `~/musiclib` replaced by `~/musiclib-restore`. `compose.yaml` fixes the Compose project name, `name: musiclib`: in a second folder the same name would select the **existing** installation's containers and volumes, so every command there would act on it. Three settings in the new folder's `.env` keep the two apart:
+To restore on a machine that still runs an installation (to test a backup, for example), use a second folder with its own `compose.yaml` and `.env`, such as `~/vibrance-restore`: paste the install block without its last line, with `~/vibrance` replaced by `~/vibrance-restore`. `compose.yaml` fixes the Compose project name, `name: musiclib`: in a second folder the same name would select the **existing** installation's containers and volumes, so every command there would act on it. Three settings in the new folder's `.env` keep the two apart:
 
 1. **Its own project name.** `COMPOSE_PROJECT_NAME` overrides `name:`; the new project gets its own containers (`musiclib-restore`, `musiclib-restore-db`) and volumes (`musiclib-restore_db`, `musiclib-restore_data`, `musiclib-restore_backup`). Check it before any other command:
 
    ```sh
-   cd ~/musiclib-restore
+   cd ~/vibrance-restore
    echo 'COMPOSE_PROJECT_NAME=musiclib-restore' >> .env
    docker compose config | head -1          # must print: name: musiclib-restore
    ```
@@ -721,7 +721,7 @@ To restore on a machine that still runs an installation (to test a backup, for e
 
    If the existing installation keeps its backups in a host folder (`MUSICLIB_BACKUP`), copy from there.
 
-Then run the restore commands of the previous section in `~/musiclib-restore`, and open `http://127.0.0.1:8081` (in a private window: the two installations share the browser's sign-in cookie). The two installations share nothing and can run side by side. When you are done with the test, `docker compose stop` in `~/musiclib-restore` stops it.
+Then run the restore commands of the previous section in `~/vibrance-restore`, and open `http://127.0.0.1:8081` (in a private window: the two installations share the browser's sign-in cookie). The two installations share nothing and can run side by side. When you are done with the test, `docker compose stop` in `~/vibrance-restore` stops it.
 
 ### Moving to another machine
 
@@ -749,7 +749,7 @@ To move the data to another folder on the same machine, see [Moving an existing 
 1.1.0 **does not start without a sign-in password** (`MUSICLIB_PASSWORD`), and the `.env` of a 1.0.0 installation has none. Add one first:
 
 ```sh
-cd ~/musiclib
+cd ~/vibrance
 grep -q '^MUSICLIB_PASSWORD=.' .env || { sed -i '/^MUSICLIB_PASSWORD=/d' .env && printf '\nMUSICLIB_PASSWORD=%s\n' "$(openssl rand -base64 24)" >> .env; }
 grep MUSICLIB_PASSWORD .env
 ```
@@ -770,7 +770,7 @@ Add the password as above and run `docker compose up -d --wait` again. A `.env` 
 ### Upgrading the published image
 
 ```sh
-cd ~/musiclib
+cd ~/vibrance
 docker compose stop app &&
 docker compose run --rm --no-deps app backup --to "/backup/before-update-$(date +%F-%H%M)" &&
 curl -fsSLO https://github.com/tommasonovelli/vibrance-musiclib/releases/latest/download/compose.yaml &&
@@ -875,13 +875,13 @@ docker compose start app
 
 The repository has four wrapper scripts in `scripts/`. Each one stops the app, runs one offline command, and starts the app again when that is safe. They are **not part of a release**: they exist only in a clone of the repository.
 
-**Where they act.** A script runs `docker compose` in the clone's folder, on the Compose file and `.env` there: `compose.yaml` and its published image, or the file named by `COMPOSE_FILE` (from the environment or from `.env`), such as `compose.dev.yaml` for a source build, so that the offline command runs the same image as the server. **Use them only when your installation runs from that clone's folder.** For an installation in `~/musiclib`, run the commands by hand in `~/musiclib`, as shown above.
+**Where they act.** A script runs `docker compose` in the clone's folder, on the Compose file and `.env` there: `compose.yaml` and its published image, or the file named by `COMPOSE_FILE` (from the environment or from `.env`), such as `compose.dev.yaml` for a source build, so that the offline command runs the same image as the server. **Use them only when your installation runs from that clone's folder.** For an installation in `~/vibrance`, run the commands by hand in `~/vibrance`, as shown above.
 
-A clone next to an installation in `~/musiclib` names the same Compose project, `musiclib`, but not its `.env`: a script run there would stop your app and run the command with other settings (another data folder, the default database password). So, before stopping anything, every script checks the folder that Docker records in each container of the project's `app` and `postgres` (the label `com.docker.compose.project.working_dir`). If a container was created in another folder, or in a folder this shell cannot see, the script stops, exits 1, and prints the commands to run by hand instead, for example:
+A clone next to an installation in `~/vibrance` names the same Compose project, `musiclib`, but not its `.env`: a script run there would stop your app and run the command with other settings (another data folder, the default database password). So, before stopping anything, every script checks the folder that Docker records in each container of the project's `app` and `postgres` (the label `com.docker.compose.project.working_dir`). If a container was created in another folder, or in a folder this shell cannot see, the script stops, exits 1, and prints the commands to run by hand instead, for example:
 
 ```text
-doctor.sh: error: the Compose project of this clone (/home/you/src/vibrance-musiclib) already has containers created from /home/you/musiclib, which has its own compose.yaml and .env (a folder this shell cannot see counts as another one). Nothing was stopped. Run the commands by hand in the installation's folder (docs/operations.md, "Maintenance"):
-  cd /home/you/musiclib
+doctor.sh: error: the Compose project of this clone (/home/you/src/vibrance-musiclib) already has containers created from /home/you/vibrance, which has its own compose.yaml and .env (a folder this shell cannot see counts as another one). Nothing was stopped. Run the commands by hand in the installation's folder (docs/operations.md, "Maintenance"):
+  cd /home/you/vibrance
   docker compose stop app
   docker compose run --rm --no-deps app doctor --deep
   docker compose start app    # after exit 0 or 1
@@ -942,7 +942,7 @@ When MusicLib refuses to start, the process exits and Docker starts it again (`r
 | Signed out unexpectedly | MusicLib restarted, 30 days passed, or you signed in to a second installation on the same machine | sign in again |
 | `password_invalid` after an upgrade from 1.0.0 | `.env` has no `MUSICLIB_PASSWORD` | see [From 1.0.0 to 1.1.0](#from-100-to-110) |
 | `password_invalid` or `config_invalid` although `.env` looks right | `.env` has Windows (CRLF) line endings | `sed -i 's/\r$//' .env`, then `docker compose up -d --wait` |
-| `docker compose up` fails with a mount error for `import` | the import folder does not exist; Compose does not create it | `mkdir -p ~/musiclib/import`, or fix `MUSICLIB_IMPORT` |
+| `docker compose up` fails with a mount error for `import` | the import folder does not exist; Compose does not create it | `mkdir -p ~/vibrance/import`, or fix `MUSICLIB_IMPORT` |
 | `volume_permission` | the data folder is not owned by uid 1000 | `sudo chown -R 1000:1000 /srv/musiclib/data`, then `docker compose restart app` |
 | An upload fails with 507 `insufficient_space` | not enough free space beyond the 1 GiB margin | free space on the data disk, then retry |
 | An album stays in **Needs attention** with `publish_destination_occupied` | a folder that MusicLib did not create is where the album must go | move that folder out of `library/`, then retry |
