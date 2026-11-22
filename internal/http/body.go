@@ -103,10 +103,14 @@ func readBody(w nethttp.ResponseWriter, r *nethttp.Request) ([]byte, *Error) {
 
 // checkJSON applies the byte-level and token-level rules of readObject.
 func checkJSON(b []byte) *Error {
+	return checkJSONDepth(b, 0)
+}
+
+func checkJSONDepth(b []byte, maxDepth int) *Error {
 	if !utf8.Valid(b) {
 		return newError(nethttp.StatusBadRequest, CodeInvalidUTF8, "the body is not valid UTF-8")
 	}
-	if e := scanTokens(b); e != nil {
+	if e := scanTokens(b, maxDepth); e != nil {
 		return e
 	}
 	return checkSurrogates(b)
@@ -115,19 +119,52 @@ func checkJSON(b []byte) *Error {
 // frame is an open object or array during scanTokens.
 type frame struct {
 	object  bool
-	path    string
 	keys    map[string]bool
 	wantKey bool   // object: the next token is a key or '}'
 	key     string // object: the key of the value being read
 	index   int    // array: the index of the value being read
 }
 
-// child is the path of the value being read inside f.
-func (f *frame) child() string {
-	if f.object {
-		return joinPath(f.path, f.key)
+const maxJSONFieldBytes = 512
+
+// jsonField formats a diagnostic only on error. Open frames keep just their
+// current key or index, never a copy of their ancestors' names.
+func jsonField(parent string, ancestors []frame, key string) string {
+	// One extra byte distinguishes a full path from a truncated one.
+	var buf [maxJSONFieldBytes + 1]byte
+	p := buf[:0]
+	add := func(s string) {
+		p = append(p, s[:min(len(s), cap(p)-len(p))]...)
 	}
-	return f.path + "[" + strconv.Itoa(f.index) + "]"
+	addKey := func(k string) {
+		if len(p) != 0 {
+			add(".")
+		}
+		add(k)
+	}
+	add(parent)
+	for i := range ancestors {
+		if len(p) == cap(p) {
+			break
+		}
+		f := &ancestors[i]
+		if f.object {
+			addKey(f.key)
+		} else {
+			add("[")
+			add(strconv.Itoa(f.index))
+			add("]")
+		}
+	}
+	addKey(key)
+	if len(p) > maxJSONFieldBytes {
+		n := maxJSONFieldBytes - len("…")
+		for !utf8.RuneStart(p[n]) {
+			n--
+		}
+		p = append(p[:n], "…"...)
+	}
+	return string(p)
 }
 
 func joinPath(parent, key string) string {
@@ -139,11 +176,11 @@ func joinPath(parent, key string) string {
 
 // scanTokens walks b with the tokenizer of encoding/json: syntax, exactly
 // one top-level value, and unique keys in every object. Keys are compared
-// after unescaping, so "a" and "a" are the same key.
-func scanTokens(b []byte) *Error {
+// after unescaping, so "a" and "\u0061" are the same key.
+func scanTokens(b []byte, maxDepth int) *Error {
 	dec := json.NewDecoder(bytes.NewReader(b))
 	dec.UseNumber()
-	var stack []*frame
+	var stack []frame
 	done := false
 	for {
 		tok, err := dec.Token()
@@ -162,13 +199,16 @@ func scanTokens(b []byte) *Error {
 		}
 		var top *frame
 		if len(stack) > 0 {
-			top = stack[len(stack)-1]
+			top = &stack[len(stack)-1]
 		}
 		if top != nil && top.object && top.wantKey {
 			if k, ok := tok.(string); ok {
 				if top.keys[k] {
-					return newError(nethttp.StatusBadRequest, CodeDuplicateKey, "the key %q appears twice in the same object",
-						joinPath(top.path, k)).with("field", joinPath(top.path, k))
+					field := jsonField("", stack[:len(stack)-1], k)
+					return newError(nethttp.StatusBadRequest, CodeDuplicateKey, "the key %q appears twice in the same object", field).with("field", field)
+				}
+				if top.keys == nil {
+					top.keys = make(map[string]bool)
 				}
 				top.keys[k], top.key, top.wantKey = true, k, false
 				continue
@@ -178,17 +218,13 @@ func scanTokens(b []byte) *Error {
 		}
 		switch tok {
 		case json.Delim('{'), json.Delim('['):
-			path := ""
-			if top != nil {
-				path = top.child()
+			if maxDepth > 0 && len(stack) == maxDepth {
+				return newError(nethttp.StatusBadRequest, CodeInvalidJSON, "the JSON is nested too deeply")
 			}
-			f := &frame{object: tok == json.Delim('{'), path: path, wantKey: true}
-			if f.object {
-				f.keys = map[string]bool{}
-			}
-			stack = append(stack, f)
+			stack = append(stack, frame{object: tok == json.Delim('{'), wantKey: true})
 			continue
 		case json.Delim('}'), json.Delim(']'):
+			stack[len(stack)-1] = frame{}
 			stack = stack[:len(stack)-1]
 		}
 		// A value just ended: a scalar, or the object or array closed above.
@@ -196,7 +232,7 @@ func scanTokens(b []byte) *Error {
 			done = true
 			continue
 		}
-		if parent := stack[len(stack)-1]; parent.object {
+		if parent := &stack[len(stack)-1]; parent.object {
 			parent.wantKey = true
 		} else {
 			parent.index++
@@ -270,9 +306,9 @@ type object struct {
 // decodeObject decodes raw, a JSON value at path, as an object whose keys
 // are exactly keys: a key outside them is 422 unknown_field, a missing one
 // 422 missing_field (the first in sorted, respectively declared, order, so
-// that the answer is deterministic). Every key is required: a field that
-// may be null is sent as null, never omitted, so that a save never clears
-// a value by accident.
+// that the answer is deterministic). Every key is required unless marked
+// with a trailing '?' in the schema. Existing saves send nullable values
+// explicitly so that a save never clears a value by accident.
 func decodeObject(raw []byte, path string, keys ...string) (object, *Error) {
 	o := object{path: path}
 	if !isKind(raw, '{') {
@@ -281,18 +317,21 @@ func decodeObject(raw []byte, path string, keys ...string) (object, *Error) {
 	if err := json.Unmarshal(raw, &o.fields); err != nil {
 		return o, invalidField(path, "must be a JSON object")
 	}
-	var unknown []string
+	var unknown string
+	var hasUnknown bool
 	for k := range o.fields {
-		if !slices.Contains(keys, k) {
-			unknown = append(unknown, k)
+		if !slices.ContainsFunc(keys, func(key string) bool { return strings.TrimSuffix(key, "?") == k }) && (!hasUnknown || k < unknown) {
+			unknown, hasUnknown = k, true
 		}
 	}
-	if len(unknown) > 0 {
-		slices.Sort(unknown)
-		f := joinPath(path, unknown[0])
+	if hasUnknown {
+		f := jsonField(path, nil, unknown)
 		return o, newError(nethttp.StatusUnprocessableEntity, CodeUnknownField, "unknown field %q", f).with("field", f)
 	}
 	for _, k := range keys {
+		if strings.HasSuffix(k, "?") {
+			continue
+		}
 		if _, ok := o.fields[k]; !ok {
 			f := joinPath(path, k)
 			return o, newError(nethttp.StatusUnprocessableEntity, CodeMissingField, "the field %q is required", f).

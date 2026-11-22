@@ -88,21 +88,21 @@ func TestBrowserSidebarCollapse(t *testing.T) {
 		t.Fatalf("first visit: %s", got)
 	}
 	// Expanded: icon and label on one grid, the labels visible.
-	if got := browserEval(t, tab, `JSON.stringify([...document.querySelectorAll('.nav a, .fix-filter')].map(a=>{const i=a.querySelector('.icon').getBoundingClientRect(),l=a.querySelector('.nav-label');return [Math.round(i.left),i.width,i.height,Math.round(l.getBoundingClientRect().left),getComputedStyle(l).clipPath]}))`); got != `[[26,20,20,60,"none"],[26,20,20,60,"none"],[26,20,20,60,"none"],[26,20,20,60,"none"],[26,20,20,60,"none"]]` {
+	if got := browserEval(t, tab, `JSON.stringify([...document.querySelectorAll('.nav a, .fix-filter')].map(a=>{const i=a.querySelector('.icon').getBoundingClientRect(),l=a.querySelector('.nav-label');return [Math.round(i.left),i.width,i.height,Math.round(l.getBoundingClientRect().left),getComputedStyle(l).clipPath]}))`); got != `[[26,20,20,60,"none"],[26,20,20,60,"none"],[26,20,20,60,"none"],[26,20,20,60,"none"],[26,20,20,60,"none"],[26,20,20,60,"none"]]` {
 		t.Fatalf("expanded rows: %s", got)
 	}
-	if got := strings.Join(accessibleNames(t, tab, `#sidebar-toggle, .nav a, .fix-filter`), "|"); got != "Library|Import|Activity|Trash|Needs attention: 1|Collapse sidebar" {
+	if got := strings.Join(accessibleNames(t, tab, `#sidebar-toggle, .nav a, .fix-filter`), "|"); got != "Library|Create album|Import|Activity|Trash|Needs attention: 1|Collapse sidebar" {
 		t.Fatalf("expanded accessible names: %s", got)
 	}
 
-	// Keyboard: the skip link, the brand, the five entries, then sign-out,
+	// Keyboard: the skip link, the brand, the six entries, then sign-out,
 	// the theme button and the toggle at the foot of the sidebar; Enter
 	// collapses.
-	for range 10 {
+	for range 11 {
 		browserKey(t, tab, kb.Tab)
 	}
 	if got := browserEval(t, tab, `document.activeElement.id`); got != "sidebar-toggle" {
-		t.Fatalf("tenth tab stop: %q", got)
+		t.Fatalf("eleventh tab stop: %q", got)
 	}
 	browserKey(t, tab, kb.Enter)
 	browserWait(t, tab, `getComputedStyle(document.querySelector('#sidebar')).width === '72px'`)
@@ -112,10 +112,10 @@ func TestBrowserSidebarCollapse(t *testing.T) {
 	// Icons only, in the same place; the labels are visually hidden but
 	// still the accessible names; the count is a badge on its icon; the
 	// active entry stays marked.
-	if got := browserEval(t, tab, `JSON.stringify([...document.querySelectorAll('.nav a, .fix-filter')].map(a=>{const i=a.querySelector('.icon').getBoundingClientRect(),l=getComputedStyle(a.querySelector('.nav-label'));return [Math.round(i.left),Math.round(a.getBoundingClientRect().width),l.position,l.clipPath]}))`); got != `[[26,48,"absolute","inset(50%)"],[26,48,"absolute","inset(50%)"],[26,48,"absolute","inset(50%)"],[26,48,"absolute","inset(50%)"],[26,48,"absolute","inset(50%)"]]` {
+	if got := browserEval(t, tab, `JSON.stringify([...document.querySelectorAll('.nav a, .fix-filter')].map(a=>{const i=a.querySelector('.icon').getBoundingClientRect(),l=getComputedStyle(a.querySelector('.nav-label'));return [Math.round(i.left),Math.round(a.getBoundingClientRect().width),l.position,l.clipPath]}))`); got != `[[26,48,"absolute","inset(50%)"],[26,48,"absolute","inset(50%)"],[26,48,"absolute","inset(50%)"],[26,48,"absolute","inset(50%)"],[26,48,"absolute","inset(50%)"],[26,48,"absolute","inset(50%)"]]` {
 		t.Fatalf("collapsed rows: %s", got)
 	}
-	if got := strings.Join(accessibleNames(t, tab, `#sidebar-toggle, .nav a, .fix-filter`), "|"); got != "Library|Import|Activity|Trash|Needs attention: 1|Expand sidebar" {
+	if got := strings.Join(accessibleNames(t, tab, `#sidebar-toggle, .nav a, .fix-filter`), "|"); got != "Library|Create album|Import|Activity|Trash|Needs attention: 1|Expand sidebar" {
 		t.Fatalf("accessible names: %s", got)
 	}
 	if got := browserEval(t, tab, `(()=>{const c=document.querySelector('.fix-filter .count'),s=getComputedStyle(c),i=document.querySelector('.fix-filter .icon').getBoundingClientRect(),r=c.getBoundingClientRect(),a=getComputedStyle(document.querySelector('.nav a[aria-current=page]'));return [c.textContent,s.position,s.backgroundColor,r.left<i.right&&r.right>i.right&&r.top<i.top+8,a.backgroundColor!=='rgba(0, 0, 0, 0)',getComputedStyle(document.querySelector('.nav a[aria-current=page] .icon')).color].join('|')})()`); got != ": 1|absolute|rgb(215, 0, 21)|true|true|rgb(29, 29, 31)" {
@@ -210,7 +210,7 @@ func TestBrowserSidebarCollapse(t *testing.T) {
 	browserWait(t, plain, `location.pathname === '/activity'`)
 }
 
-// On a phone the sidebar is a row of the four views, icon over label, with
+// On a phone the sidebar is a row of the main views, icon over label, with
 // Needs attention as its icon and count, and no toggle, whatever the
 // remembered state.
 func TestBrowserSidebarPhone(t *testing.T) {
@@ -226,10 +226,10 @@ func TestBrowserSidebarPhone(t *testing.T) {
 	browserGo(t, tab, e.srv.URL+"/activity")
 	browserWait(t, tab, `document.readyState === 'complete'`)
 	got := browserEval(t, tab, `(()=>{const s=document.querySelector('#sidebar').getBoundingClientRect(),items=[...document.querySelectorAll('.nav a')].map(a=>{const i=a.querySelector('.icon').getBoundingClientRect(),l=a.querySelector('.nav-label').getBoundingClientRect();return [a.querySelector('.nav-label').textContent,i.width,Math.round(i.top-s.top)===Math.round(document.querySelector('.nav a .icon').getBoundingClientRect().top-s.top),l.top>=i.bottom,Math.abs((i.left+i.right)/2-(l.left+l.right)/2)<1]});return JSON.stringify([getComputedStyle(document.querySelector('.brand')).display,Math.round(s.width),document.documentElement.scrollWidth<=390,items,getComputedStyle(document.querySelector('.fix-filter .nav-label')).clipPath,document.querySelector('.fix-filter').getBoundingClientRect().top<s.bottom])})()`)
-	if got != `["none",390,true,[["Library",20,true,true,true],["Import",20,true,true,true],["Activity",20,true,true,true],["Trash",20,true,true,true]],"inset(50%)",true]` {
+	if got != `["none",390,true,[["Library",20,true,true,true],["Create album",20,true,true,true],["Import",20,true,true,true],["Activity",20,true,true,true],["Trash",20,true,true,true]],"inset(50%)",true]` {
 		t.Fatalf("phone row: %s", got)
 	}
-	if got := strings.Join(accessibleNames(t, tab, `.nav a, .fix-filter`), "|"); got != "Library|Import|Activity|Trash|Needs attention: 1" {
+	if got := strings.Join(accessibleNames(t, tab, `.nav a, .fix-filter`), "|"); got != "Library|Create album|Import|Activity|Trash|Needs attention: 1" {
 		t.Fatalf("phone names: %s", got)
 	}
 	if got := browserEval(t, tab, `JSON.stringify(window.cspViolations)`); got != "[]" {

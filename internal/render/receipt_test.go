@@ -3,8 +3,10 @@ package render
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"math/rand/v2"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -14,6 +16,7 @@ import (
 
 func goldenReceipt() Receipt {
 	return Receipt{
+		SchemaVersion: legacyReceiptVersion,
 		AlbumID:       uuid.MustParse("0192a5f0-1c2d-7e3f-8a4b-5c6d7e8f9a0b"),
 		BuildID:       uuid.MustParse("0192a5f0-ffff-7000-8000-000000000001"),
 		AlbumRevision: 12,
@@ -27,21 +30,28 @@ func goldenReceipt() Receipt {
 	}
 }
 
-// The canonical form is pinned byte for byte (§9.2): the key order, no
-// whitespace, no trailing newline, raw UTF-8 without HTML or U+2028
-// escaping. A change here changes every receipt_hash: it needs a new
-// RendererRevision.
-func TestReceiptGolden(t *testing.T) {
-	got, err := goldenReceipt().Encode()
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := `{"schema_version":1,"album_id":"0192a5f0-1c2d-7e3f-8a4b-5c6d7e8f9a0b","build_id":"0192a5f0-ffff-7000-8000-000000000001",` +
+// Keep these v1 bytes independent of the current writer. The key order,
+// absence of whitespace and trailing newline, and raw UTF-8 (including
+// HTML characters and U+2028) are part of the on-disk format.
+func goldenV1ReceiptBytes() string {
+	return `{"schema_version":1,"album_id":"0192a5f0-1c2d-7e3f-8a4b-5c6d7e8f9a0b","build_id":"0192a5f0-ffff-7000-8000-000000000001",` +
 		`"album_revision":12,"render_version":"musiclib-render/1 names/1 go1.25.14 ffmpeg/8.1.3-musiclib1 musiclib-tags/2 taglib/2.3.2-musiclib1",` +
 		`"files":[{"relative_path":"01 - So What.flac","size":1234567,"sha256":"` + strings.Repeat("a", 64) + `"},` +
 		`{"relative_path":"01 - So What.lrc","size":0,"sha256":"` + strings.Repeat("0", 64) + `"},` +
 		`{"relative_path":"Extras/<&> ` + "é" + lineSep + "" + `.pdf","size":9,"sha256":"` + strings.Repeat("f", 64) + `"},` +
 		`{"relative_path":"cover.jpg","size":20,"sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}]}`
+}
+
+func TestReceiptGolden(t *testing.T) {
+	want := goldenV1ReceiptBytes()
+	r, err := ParseReceipt([]byte(want))
+	if err != nil {
+		t.Fatalf("parse the v1 golden receipt: %v", err)
+	}
+	got, err := r.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if string(got) != want {
 		t.Fatalf("encoding\n%s\nwant\n%s", got, want)
 	}
@@ -56,12 +66,151 @@ func TestReceiptGolden(t *testing.T) {
 	if len(generic) != 6 {
 		t.Fatalf("%d top-level fields, want exactly six", len(generic))
 	}
-	empty := goldenReceipt()
+	empty := r
 	empty.Files = nil
 	got, err = empty.Encode()
 	if err != nil || !bytes.HasSuffix(got, []byte(`"files":[]}`)) {
 		t.Fatalf("no files: %s %v", got, err)
 	}
+}
+
+func goldenV2Receipt() Receipt {
+	r := goldenReceipt()
+	r.SchemaVersion = ReceiptSchemaVersion
+	r.StoreID = uuid.MustParse("11111111-1111-4111-8111-111111111111")
+	r.Files[0].TrackID = uuid.MustParse("abcdef01-2345-4789-8abc-def012345678")
+	r.Files[0].SourceBlobSHA256 = strings.Repeat("b", 64)
+	// An audio-looking attachment has no track identity.
+	r.Files[2].RelativePath = "Extras/<&> é" + lineSep + ".flac"
+	return r
+}
+
+func goldenV2ReceiptBytes() string {
+	return `{"schema_version":2,"store_id":"11111111-1111-4111-8111-111111111111","album_id":"0192a5f0-1c2d-7e3f-8a4b-5c6d7e8f9a0b","build_id":"0192a5f0-ffff-7000-8000-000000000001",` +
+		`"album_revision":12,"render_version":"musiclib-render/1 names/1 go1.25.14 ffmpeg/8.1.3-musiclib1 musiclib-tags/2 taglib/2.3.2-musiclib1",` +
+		`"files":[{"relative_path":"01 - So What.flac","size":1234567,"sha256":"` + strings.Repeat("a", 64) + `",` +
+		`"track_id":"abcdef01-2345-4789-8abc-def012345678","source_blob_sha256":"` + strings.Repeat("b", 64) + `"},` +
+		`{"relative_path":"01 - So What.lrc","size":0,"sha256":"` + strings.Repeat("0", 64) + `"},` +
+		`{"relative_path":"Extras/<&> é` + lineSep + `.flac","size":9,"sha256":"` + strings.Repeat("f", 64) + `"},` +
+		`{"relative_path":"cover.jpg","size":20,"sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}]}`
+}
+
+func TestReceiptV2Golden(t *testing.T) {
+	want := goldenV2Receipt()
+	literal := goldenV2ReceiptBytes()
+	got, err := ParseReceipt([]byte(literal))
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("parse v2: %+v, %v; want %+v", got, err, want)
+	}
+	encoded, err := got.Encode()
+	if err != nil || string(encoded) != literal || ReceiptHash(encoded) != hashOf(literal) {
+		t.Fatalf("encode v2: %s, %v", encoded, err)
+	}
+	// Different tracks may reference the same original.
+	got.Files[1].TrackID, got.Files[1].SourceBlobSHA256 = uuid.New(), got.Files[0].SourceBlobSHA256
+	encoded, err = got.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ParseReceipt(encoded); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReceiptV2Strict(t *testing.T) {
+	literal := goldenV2ReceiptBytes()
+	const id = `"track_id":"abcdef01-2345-4789-8abc-def012345678"`
+	source := `"source_blob_sha256":"` + strings.Repeat("b", 64) + `"`
+	store := `"store_id":"11111111-1111-4111-8111-111111111111"`
+	for _, tc := range []struct{ name, old, new string }{
+		{"unknown version", `"schema_version":2`, `"schema_version":3`},
+		{"v1 with v2 fields", `"schema_version":2`, `"schema_version":1`},
+		{"v1 with track fields only", `"schema_version":2,` + store, `"schema_version":1`},
+		{"no store", store + ",", ""},
+		{"duplicate store field", store, store + "," + store},
+		{"null store", store, `"store_id":null`},
+		{"nil store", store, `"store_id":"00000000-0000-0000-0000-000000000000"`},
+		{"track ID only", "," + source, ""},
+		{"source hash only", id + ",", ""},
+		{"null pair", id + "," + source, `"track_id":null,"source_blob_sha256":null`},
+		{"nil track ID", id, `"track_id":"00000000-0000-0000-0000-000000000000"`},
+		{"invalid track ID", id, `"track_id":"bad"`},
+		{"uppercase track ID", id, `"track_id":"ABCDEF01-2345-4789-8ABC-DEF012345678"`},
+		{"duplicate track ID", source + `},{"relative_path":"01 - So What.lrc","size":0,"sha256":"` + strings.Repeat("0", 64) + `"`,
+			source + `},{"relative_path":"01 - So What.lrc","size":0,"sha256":"` + strings.Repeat("0", 64) + `",` + id + "," + source},
+		{"uppercase source", source, strings.Replace(source, strings.Repeat("b", 64), strings.Repeat("B", 64), 1)},
+		{"short source", source, `"source_blob_sha256":"bad"`},
+		{"duplicate track field", id, id + "," + id},
+		{"reordered provenance", id + "," + source, source + "," + id},
+		{"invalid path", "cover.jpg", "../cover.jpg"},
+		{"invalid size", `"size":0`, `"size":-1`},
+		{"invalid output hash", strings.Repeat("a", 64), strings.Repeat("A", 64)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if !strings.Contains(literal, tc.old) {
+				t.Fatal("fixture did not match")
+			}
+			_, err := ParseReceipt([]byte(strings.Replace(literal, tc.old, tc.new, 1)))
+			wantRenderCode(t, err, CodeReceiptInvalid)
+		})
+	}
+}
+
+func TestReceiptSizeBounds(t *testing.T) {
+	// Exercise the boundary with real file entries, not padding outside
+	// the JSON. There can be more attachments than an import can supply.
+	legacy := goldenReceipt()
+	legacy.Files = nil
+	sum := hashOf("file")
+	for i := range maxReceiptTracks {
+		legacy.Files = append(legacy.Files, ReceiptFile{RelativePath: fmt.Sprintf("%04d - Track.flac", i), SHA256: sum})
+	}
+	longPath := strings.Repeat(strings.Repeat("x", 169)+"/", 5) + strings.Repeat("y", 160)
+	base := len(legacy.encode())
+	for i := 0; ; i++ {
+		f := ReceiptFile{RelativePath: fmt.Sprintf("Extras/%06d/%s", i, longPath), SHA256: sum}
+		// e.g. ,{"relative_path":"...","size":0,"sha256":"..."}
+		n := len(`,{"relative_path":"","size":0,"sha256":""}`) + len(f.RelativePath) + len(sum)
+		if base+n > maxLegacyReceiptBytes {
+			break
+		}
+		legacy.Files = append(legacy.Files, f)
+		base += n
+	}
+	legacy.RenderVersion += strings.Repeat("x", maxLegacyReceiptBytes-base)
+	v2 := legacy
+	v2.SchemaVersion, v2.StoreID = ReceiptSchemaVersion, uuid.New()
+	v2.Files = slices.Clone(legacy.Files)
+	for i := range maxReceiptTracks {
+		v2.Files[i].TrackID, v2.Files[i].SourceBlobSHA256 = uuid.New(), sum
+	}
+	for _, tc := range []struct {
+		r     Receipt
+		limit int
+	}{{legacy, 16 << 20}, {v2, MaxReceiptBytes}} {
+		b, err := tc.r.Encode()
+		if err != nil || len(b) != tc.limit {
+			t.Fatalf("v%d boundary: %d bytes, %v; want %d", tc.r.SchemaVersion, len(b), err, tc.limit)
+		}
+		if _, err := ParseReceipt(b); err != nil {
+			t.Fatal(err)
+		}
+		tc.r.RenderVersion += "x"
+		_, err = ParseReceipt(tc.r.encode()) // canonical but one byte too large
+		wantRenderCode(t, err, CodeReceiptInvalid)
+		_, err = tc.r.Encode()
+		wantRenderCode(t, err, CodeReceiptInvalid)
+	}
+	// A v2 receipt cannot use unused provenance allowance for attachments.
+	v2.Files[0].TrackID, v2.Files[0].SourceBlobSHA256 = uuid.Nil, ""
+	v2.RenderVersion += "x"
+	_, err := ParseReceipt(v2.encode())
+	wantRenderCode(t, err, CodeReceiptInvalid)
+	v2.RenderVersion = legacy.RenderVersion
+	v2.Files[0].TrackID, v2.Files[0].SourceBlobSHA256 = uuid.New(), sum
+	v2.Files[maxReceiptTracks].TrackID, v2.Files[maxReceiptTracks].SourceBlobSHA256 = uuid.New(), sum
+	_, err = v2.Encode()
+	wantRenderCode(t, err, CodeReceiptInvalid)
 }
 
 // Escaping: only '"', '\' and control characters; the parser accepts only
@@ -134,17 +283,10 @@ func sortFiles(fs []ReceiptFile) {
 	}
 }
 
-// The parser is strict (§9.4, §11.3): anything but the canonical encoding of
-// a valid receipt is refused.
+// The parser refuses anything but the canonical encoding of a valid receipt.
+// Mutate the literal v1 bytes so these cases keep exercising the v1 parser.
 func TestParseReceiptStrict(t *testing.T) {
-	valid, err := goldenReceipt().Encode()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := ParseReceipt(valid); err != nil {
-		t.Fatalf("the golden receipt: %v", err)
-	}
-	s := string(valid)
+	s := goldenV1ReceiptBytes()
 	replace := func(old, new string) string {
 		if !strings.Contains(s, old) {
 			t.Fatalf("%q not in the receipt", old)
@@ -168,7 +310,7 @@ func TestParseReceiptStrict(t *testing.T) {
 		"a missing file field":     replace(`"size":9,`, ``),
 		"files null":               s[:strings.Index(s, `"files":`)] + `"files":null}`,
 		"keys reordered":           replace(`"album_id":"0192a5f0-1c2d-7e3f-8a4b-5c6d7e8f9a0b","build_id":"0192a5f0-ffff-7000-8000-000000000001"`, `"build_id":"0192a5f0-ffff-7000-8000-000000000001","album_id":"0192a5f0-1c2d-7e3f-8a4b-5c6d7e8f9a0b"`),
-		"schema_version 2":         replace(`"schema_version":1`, `"schema_version":2`),
+		"v2 declared on v1 bytes":  replace(`"schema_version":1`, `"schema_version":2`),
 		"schema_version 1.0":       replace(`"schema_version":1`, `"schema_version":1.0`),
 		"schema_version as text":   replace(`"schema_version":1`, `"schema_version":"1"`),
 		"an upper-case UUID":       replace(`0192a5f0-1c2d-7e3f-8a4b-5c6d7e8f9a0b`, `0192A5F0-1C2D-7E3F-8A4B-5C6D7E8F9A0B`),
@@ -203,7 +345,7 @@ func TestParseReceiptStrict(t *testing.T) {
 			wantRenderCode(t, err, CodeReceiptInvalid)
 		})
 	}
-	if _, err := ParseReceipt(bytes.Repeat([]byte(" "), MaxReceiptBytes+1)); Code(err) != CodeReceiptInvalid {
+	if _, err := ParseReceipt(bytes.Repeat([]byte(" "), maxLegacyReceiptBytes+1)); Code(err) != CodeReceiptInvalid {
 		t.Errorf("an oversized receipt: %v", err)
 	}
 }
@@ -303,7 +445,7 @@ func TestReceiptPathLimits(t *testing.T) {
 					t.Fatalf("Encode accepted %d bytes, %d levels: %v", len(tc.path), strings.Count(tc.path, "/")+1, err)
 				}
 				// ParseReceipt refuses the same bytes, written by hand.
-				forged := strings.Replace(string(mustEncode(t, goldenReceipt())), `"cover.jpg"`, `"`+tc.path+`"`, 1)
+				forged := strings.Replace(goldenV1ReceiptBytes(), `"cover.jpg"`, `"`+tc.path+`"`, 1)
 				if _, err := ParseReceipt([]byte(forged)); Code(err) != CodeReceiptInvalid {
 					t.Fatalf("ParseReceipt accepted it: %v", err)
 				}
@@ -317,13 +459,4 @@ func TestReceiptPathLimits(t *testing.T) {
 			}
 		})
 	}
-}
-
-func mustEncode(t *testing.T, r Receipt) []byte {
-	t.Helper()
-	b, err := r.Encode()
-	if err != nil {
-		t.Fatal(err)
-	}
-	return b
 }

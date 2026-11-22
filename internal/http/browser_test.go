@@ -16,6 +16,11 @@ import (
 // the real HTTP handler and PostgreSQL. No DOM emulation or JS mock is used.
 func browserEnv(t *testing.T) (*env, context.Context) {
 	t.Helper()
+	return browserEnvWithWrapper(t, nil)
+}
+
+func browserEnvWithWrapper(t *testing.T, wrap func(http.Handler) http.Handler) (*env, context.Context) {
+	t.Helper()
 	e := newEnv(t)
 	e.srv.Close()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -25,7 +30,11 @@ func browserEnv(t *testing.T) (*env, context.Context) {
 	mux := http.NewServeMux()
 	mux.Handle("/api/", e.api)
 	mux.HandleFunc("/", e.api.Pages)
-	srv := httptest.NewUnstartedServer(e.signedIn(mux))
+	h := http.Handler(mux)
+	if wrap != nil {
+		h = wrap(h)
+	}
+	srv := httptest.NewUnstartedServer(e.signedIn(h))
 	srv.Listener = listener
 	srv.Start()
 	t.Cleanup(srv.Close)

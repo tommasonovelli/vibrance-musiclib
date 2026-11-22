@@ -100,6 +100,9 @@ func newEnvOn(t *testing.T, dbURL string, db *pgxpool.Pool, data string) *env {
 		Failpoints: e.bfp.Hook()}); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := store.New(db).InsertStoreID(t.Context(), store.NewID()); err != nil {
+		t.Fatal(err)
+	}
 	e.p = e.publisher(db)
 	if e.cat, err = catalog.New(db, nil, func(catalog.Blob, string) error { return nil }, importer.GenreFits); err != nil {
 		t.Fatal(err)
@@ -113,7 +116,11 @@ func newEnvOn(t *testing.T, dbURL string, db *pgxpool.Pool, data string) *env {
 // publisher is a new publisher on db: a fresh process's, with no memory.
 func (e *env) publisher(db *pgxpool.Pool) *Publisher {
 	e.t.Helper()
-	p, err := New(Config{DB: db, Library: e.lib, Work: e.work, Builder: e.b,
+	id, err := store.New(db).GetStoreID(e.t.Context())
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	p, err := New(Config{DB: db, StoreID: id, Library: e.lib, Work: e.work, Builder: e.b,
 		Log: slog.New(slog.NewJSONHandler(io.MultiWriter(e.logs), nil)), Failpoints: e.fp.Hook()})
 	if err != nil {
 		e.t.Fatal(err)
@@ -235,10 +242,14 @@ func stageBuild(t testing.TB, data string, snap *jobs.RenderSnapshot, content st
 		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		rf = append(rf, render.ReceiptFile{RelativePath: rel, Size: int64(len(body)), SHA256: sha([]byte(body))})
+		f := render.ReceiptFile{RelativePath: rel, Size: int64(len(body)), SHA256: sha([]byte(body))}
+		if rel == "01 - One.flac" && len(snap.Tracks) != 0 {
+			f.TrackID, f.SourceBlobSHA256 = snap.Tracks[0].ID, snap.Tracks[0].Blob.Hash
+		}
+		rf = append(rf, f)
 	}
 	sort.Slice(rf, func(i, j int) bool { return rf[i].RelativePath < rf[j].RelativePath })
-	r := render.Receipt{AlbumID: res.AlbumID, BuildID: res.BuildID, AlbumRevision: res.AlbumRevision,
+	r := render.Receipt{SchemaVersion: render.ReceiptSchemaVersion, StoreID: snap.StoreID, AlbumID: res.AlbumID, BuildID: res.BuildID, AlbumRevision: res.AlbumRevision,
 		RenderVersion: res.RenderVersion, Files: rf}
 	b, err := r.Encode()
 	if err != nil {

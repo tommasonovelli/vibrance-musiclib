@@ -41,10 +41,14 @@ func SameArtistName(name, other string) bool {
 //
 // It only reads; the caller creates the new artist.
 func resolveArtist(ctx context.Context, tx *store.CatalogTx, name string) (artistRef, error) {
+	return resolveArtistWithID(ctx, tx, name, store.NewID())
+}
+
+func resolveArtistWithID(ctx context.Context, tx *store.CatalogTx, name string, newID uuid.UUID) (artistRef, error) {
 	key := names.FolderKey(name)
 	a, err := tx.GetArtistByFolderKey(ctx, key)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return artistRef{ID: store.NewID(), Name: name, FolderKey: key}, nil
+		return artistRef{ID: newID, Name: name, FolderKey: key}, nil
 	}
 	if err != nil {
 		return artistRef{}, dbErr("looking up the artist folder "+key, err)

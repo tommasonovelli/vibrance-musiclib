@@ -415,24 +415,21 @@ input[type="checkbox"] { width: 1rem; height: 1rem; min-height: 0; margin: 0; ac
 .band, .files li, .section-head { display: flex; align-items: center; justify-content: space-between; }
 .band { margin-top: var(--s4); padding: var(--s3) var(--s4); border-radius: var(--r-panel); background: var(--fill); }
 .band .btn { background: var(--paper); }
-/* An album's head lies on its own cover (app.js sets --cover once the
-   image is decoded): the cover, stretched across the page and blurred to
-   a colour field, so every colour sits where it is in the image, fading
-   in eased steps into the page before the tracks, with the sidebar's
-   grain on it. The layer overhangs the page so the blur has no pale
-   edges; the page clips it. Background only; it fades in once the cover
-   is ready. The fields' hover fill is see-through, so it tints the field
-   instead of cutting a box out of it. */
-.page:has(> #editor) { position: relative; isolation: isolate; overflow-x: clip; }
-.page:has(> #editor)::before, .page:has(> #editor)::after {
-  content: ""; position: absolute; inset: -8rem -8rem auto; z-index: -1; height: 38rem;
+/* Album artwork becomes a colour field behind the head: the editor uses
+   a background image and the local draft uses a canvas. Both overhang the
+   page to avoid pale blur edges and fade into paper under the same grain. */
+.page:has(> :is(#editor, #draft)) { position: relative; isolation: isolate; overflow-x: clip; }
+.page:has(> #editor)::before, .page:has(> :is(#editor, #draft))::after, #draft-glow {
+  position: absolute; inset: -8rem -8rem auto; z-index: -1; height: 38rem;
   pointer-events: none; opacity: 0; transition: opacity var(--slow) var(--ease);
   mask: linear-gradient(#000 30%, rgb(0 0 0 / .75) 48%, rgb(0 0 0 / .4) 64%, rgb(0 0 0 / .12) 80%, transparent 92%);
 }
-.page:has(> #editor)::before { background: var(--cover) center 30% / cover; filter: blur(80px) saturate(1.6); }
-.page:has(> #editor)::after { background: url(grain.svg); mix-blend-mode: soft-light; }
-.page:has(> #editor)[data-glow]::before { opacity: .55; }
-.page:has(> #editor)[data-glow]::after { opacity: .2; }
+.page:has(> #editor)::before { content: ""; background: var(--cover) center 30% / cover; }
+#draft-glow { width: calc(100% + 16rem); object-fit: cover; object-position: center 30%; z-index: -2; }
+.page:has(> #editor)::before, #draft-glow { filter: blur(80px) saturate(1.6); }
+.page:has(> :is(#editor, #draft))::after { content: ""; background: url(grain.svg); mix-blend-mode: soft-light; }
+.page:has(> #editor)[data-glow]::before, .page[data-glow=""] > #draft-glow { opacity: .55; }
+.page:has(> :is(#editor, #draft))[data-glow]:not([data-glow="fading"])::after { opacity: .2; }
 /* On the field the head's links are in ink: the Violet cannot keep its
    contrast on every cover's colour. */
 .page[data-glow] :is(.backlink, .album-head .link), .album-head > .dots { color: var(--ink); }
@@ -595,6 +592,70 @@ a.row-link:hover .row-title { text-decoration: underline; }
 .advanced summary { width: fit-content; font: var(--type-head); cursor: pointer; }
 .advanced > p:not(:empty) { max-width: 60ch; margin: var(--s2) 0 var(--s3); color: var(--graphite); }
 
+/* Create album: a local track list and compact album fields. */
+#draft { max-width: 68rem; container-type: inline-size; overflow-wrap: anywhere; }
+.draft-intro { margin-bottom: var(--s5); color: var(--graphite); }
+#draft fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
+/* A little paper over the field keeps small draft labels readable even
+   with black or white artwork. The saved album's field is unchanged. */
+.page:has(> #draft)::before { content: ""; position: absolute; inset: 0; z-index: -1; background: var(--paper); opacity: .28; pointer-events: none; }
+.page[data-glow] > #draft { --graphite: var(--ink); }
+.page[data-glow] #draft :is(a:not(.btn), .link, summary) { color: var(--ink); text-decoration: underline; }
+.draft-grid, .draft-side, .draft-section, .draft-confirm { display: grid; align-content: start; }
+.draft-grid, .draft-side { gap: clamp(var(--s6), 5cqi, var(--s7)); }
+.draft-grid { align-items: start; }
+.draft-section { gap: var(--s3); }
+.draft-section h2 { font: var(--type-title); }
+.draft-heading, .draft-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2) var(--s3); }
+.draft-heading { justify-content: space-between; }
+#draft-count { color: var(--graphite); font: var(--type-note); }
+.draft-picker, #draft-cover-drop {
+  border: 1px dashed var(--graphite); border-radius: var(--r-control); background: var(--fill);
+  outline: 2px solid transparent; outline-offset: 2px; transition: outline-color var(--quick) var(--ease);
+}
+:is(.draft-picker, #draft-cover-drop).is-drop { outline-color: var(--accent); }
+.draft-picker { display: flex; align-items: flex-start; gap: var(--s3); padding: var(--s4); }
+.draft-picker > svg { flex: none; margin-top: var(--s2); color: var(--accent); }
+.draft-picker .btn, #pick-cover { background: var(--paper); border: 1px solid var(--hairline); }
+#draft-cover-drop {
+  position: relative; display: grid; place-items: center; width: min(100%, 24rem); aspect-ratio: 1;
+  overflow: hidden; padding: var(--s3); text-align: center; color: var(--graphite); font: var(--type-note);
+}
+#draft-cover-drop:has(canvas:not([hidden])) { border-style: solid; border-color: var(--hairline); box-shadow: var(--shadow-cover); }
+#draft-art { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; animation: draft-reveal var(--slow) var(--ease); }
+@keyframes draft-reveal { from { opacity: 0; } }
+.draft-picker p, #draft-artist-note { margin-top: var(--s2); }
+#draft .btn { min-height: 2.5rem; max-width: 100%; white-space: normal; }
+#draft .link { display: inline-flex; align-items: center; min-height: 2.25rem; }
+#draft label:not(.check) { display: grid; gap: var(--s1); min-width: 0; font-weight: 500; }
+#draft :is(select, input:not([type="checkbox"])) { width: 100%; min-width: 0; min-height: 2.5rem; font: inherit; font-weight: 400; }
+#draft select { padding: var(--s1) var(--s2); border: 1px solid var(--hairline); border-radius: var(--r-control); background: var(--paper); color: var(--ink); }
+#draft input[name="year"] { text-align: left; }
+#draft :is(input, select):disabled { color: var(--graphite); background: var(--fill); }
+#draft .check { display: flex; align-items: center; gap: var(--s2); }
+.draft-track-head { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: start; gap: var(--s2); }
+.draft-track-head :is(svg, .file-name) { margin-top: var(--s2); }
+.draft-form-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2fr); gap: var(--s2) var(--s3); }
+.draft-wide { grid-column: 1 / -1; }
+#draft-tracks { margin: 0; padding: 0; list-style: none; }
+#draft-tracks li { padding-block: var(--s3) var(--s1); border-top: 1px solid var(--hairline); }
+#draft-tracks details { margin-left: calc(20px + var(--s2)); }
+#draft-tracks summary { width: fit-content; padding-block: var(--s2); color: var(--accent); font: var(--type-note); cursor: pointer; }
+#draft-tracks .draft-form-grid { padding-bottom: var(--s2); }
+#draft-cover-name:not(:empty) { margin-top: var(--s2); }
+#draft-status:empty { display: none; }
+.draft-confirm { margin-top: var(--s5); padding-top: var(--s4); border-top: 1px solid var(--hairline); gap: var(--s2); }
+.draft-confirm-note { max-width: 66ch; }
+.draft-confirm .draft-actions { margin-top: var(--s2); }
+#draft .notice { margin: 0; }
+#draft-status { color: var(--graphite); }
+@container (width >= 48rem) {
+  .draft-grid { grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); }
+  #draft-tracks .draft-form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  #draft-tracks label:has(:is([name="artist"], [name="genre"])) { grid-column: auto; }
+  #draft-tracks .check { grid-column: 2; }
+}
+
 /* 10. Motion answers the user; pages change by view transition. */
 
 @media (prefers-reduced-motion: no-preference) {
@@ -605,7 +666,7 @@ a.row-link:hover .row-title { text-decoration: underline; }
   *, *::before, *::after { animation: none !important; transition-duration: 0s !important; }
 }
 
-/* 11. Narrow screens: the sidebar becomes a row of the four views, each
+/* 11. Narrow screens: the sidebar becomes a row of the main views, each
    icon over its label; Needs attention is its icon and count, when any. */
 
 @media (max-width: 52rem) {
@@ -620,6 +681,9 @@ a.row-link:hover .row-title { text-decoration: underline; }
   .nav { flex: 1; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: var(--s1); }
   .nav a { grid-template-columns: minmax(0, 1fr); justify-items: center; gap: 2px; padding: 6px var(--s1); font: var(--type-caption); }
   .nav a[aria-current="page"] { font-weight: 650; }
+  .nav a { height: 100%; align-content: start; }
+  .nav a:focus-visible { outline-offset: -3px; }
+  .nav .nav-create { white-space: normal; text-align: center; }
   #nav-active { position: absolute; left: calc(50% + 7px); top: 6px; outline: 2px solid var(--paper); }
   .fix-filter { grid-template-columns: auto auto; gap: var(--s1); padding-inline: var(--s2); }
   .fix-filter .nav-label { position: absolute; clip-path: inset(50%); }
@@ -643,6 +707,14 @@ a.row-link:hover .row-title { text-decoration: underline; }
   .panel-cover { width: min(100%, 15rem); }
   .panel-title { font: var(--type-title); }
   .savebar { left: 0; padding-inline: var(--s4); }
+}
+
+/* Keep room for five readable destinations even with Needs attention visible. */
+@media (max-width: 32rem) {
+  .sidebar { display: grid; grid-template-columns: minmax(0, 1fr) auto; }
+  .sidebar .nav { grid-column: 1 / -1; }
+  .sidebar .fix-filter { justify-self: end; }
+  .sidebar-foot { grid-column: 2; }
 }
 
 /* Progressive enhancement: continuous corners where supported. */

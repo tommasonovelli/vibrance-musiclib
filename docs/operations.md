@@ -23,7 +23,7 @@ For building, testing and releasing MusicLib itself, see the [developer guide](d
 4. [Where your files are](#where-your-files-are)
 5. [The passwords](#the-passwords)
 6. [Access from other devices](#access-from-other-devices)
-7. [Importing and the Activity page](#importing-and-the-activity-page)
+7. [Importing and the Activity page](#importing-and-the-activity-page), including [browser creation](#creating-an-album-in-the-browser)
 8. [Backups, restore and moving](#backups-restore-and-moving)
 9. [Upgrading](#upgrading)
 10. [Maintenance](#maintenance)
@@ -32,7 +32,7 @@ For building, testing and releasing MusicLib itself, see the [developer guide](d
 
 ## What you need
 
-- **Ubuntu 24.04 or later** on an **amd64** (x86-64) machine. It was verified on Ubuntu 26.04 with Docker Engine 29.1.3 and Compose 2.40.3.
+- **Ubuntu 24.04 or later** on an **amd64** (x86-64) machine. Release 1.2.0 was verified on Ubuntu 26.04 with Docker Engine 29.1.3 and Compose 2.40.3.
 - **Docker Engine** with the **Compose v2** plugin (`docker compose`), from Docker's own packages or from Ubuntu's (`sudo apt install docker.io docker-compose-v2`). Your user must be able to run `docker` without `sudo`: `sudo usermod -aG docker "$USER"`, then sign out and in again.
 - **Local ext4 storage** for MusicLib's data: Docker's own storage (`/var/lib/docker`, where named volumes live), or the host folder you choose for it.
 - `curl` and `openssl`: `sudo apt install curl openssl` if they are missing.
@@ -56,32 +56,57 @@ findmnt -no FSTYPE -T /var/lib/docker      # must print ext4
 
 ## Install
 
-### First start
+### Prepare the release files (do not start yet)
 
-MusicLib is published as a Docker image, `ghcr.io/tommasonovelli/musiclib`, for Linux amd64. An installation needs only two files of a release: `compose.yaml` and `env.example` (the repository's `.env.example`, attached without its leading dot). Nothing is built.
-
-Paste this block into a terminal:
+MusicLib is published as a Docker image, `ghcr.io/tommasonovelli/musiclib`, for Linux amd64. For a fresh installation, paste this whole block into a terminal. Set `tag` to the **exact tag on the release page** and change `dir` if preparing a different folder, such as `~/vibrance-restore`. The published **1.2.0** release predates `musiclib`; the block skips that asset for `v1.2.0`. If using another release that predates the command, use its own install guide.
 
 ```sh
-mkdir -p ~/vibrance/import && cd ~/vibrance
-[ -e compose.yaml ] || curl -fsSLO https://github.com/tommasonovelli/vibrance-musiclib/releases/latest/download/compose.yaml
-[ -e .env ] || { curl -fsSL -o .env https://github.com/tommasonovelli/vibrance-musiclib/releases/latest/download/env.example && chmod 600 .env && sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$(openssl rand -hex 32)/" .env && sed -i "s|^MUSICLIB_PASSWORD=.*|MUSICLIB_PASSWORD=$(openssl rand -base64 24)|" .env; }
-docker compose up -d --wait
+(
+  set -e
+  tag=v1.2.0
+  dir=~/vibrance
+  mkdir -p "$dir/import"
+  cd "$dir"
+  for file in compose.yaml musiclib .env; do
+    if [ -e "$file" ] || [ -L "$file" ]; then
+      printf '%s\n' 'Use a fresh folder or follow the upgrade guide.' >&2
+      exit 1
+    fi
+  done
+  url="https://github.com/tommasonovelli/vibrance-musiclib/releases/download/$tag"
+  tmp=$(mktemp -d .musiclib-download.XXXXXX)
+  trap 'rm -rf -- "$tmp"' EXIT
+  curl -fsSL -o "$tmp/compose.yaml" "$url/compose.yaml"
+  if [ "$tag" != v1.2.0 ]; then
+    curl -fsSL -o "$tmp/musiclib" "$url/musiclib"
+    chmod 755 "$tmp/musiclib"
+  fi
+  curl -fsSL -o "$tmp/.env" "$url/env.example"
+  chmod 644 "$tmp/compose.yaml"
+  chmod 600 "$tmp/.env"
+  db_password=$(openssl rand -hex 32)
+  app_password=$(openssl rand -base64 24)
+  sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$db_password/" "$tmp/.env"
+  sed -i "s|^MUSICLIB_PASSWORD=.*|MUSICLIB_PASSWORD=$app_password|" "$tmp/.env"
+  mv -f -- "$tmp/compose.yaml" compose.yaml
+  if [ "$tag" != v1.2.0 ]; then
+    mv -f -- "$tmp/musiclib" musiclib
+  fi
+  mv -f -- "$tmp/.env" .env
+)
 ```
 
-What each line does:
+This downloads to a temporary directory and moves each prepared file into place only after all downloads and configuration succeed. It sets random database and sign-in passwords in `.env` without printing them. It creates **no Docker resources**. Do not run the first-start block if preparing a [restore](#restore-use-new-empty-destinations). To use host folders for data or backups, configure them [now](#the-data-in-a-host-folder). For an existing installation, use [Upgrading](#upgrading) instead.
 
-1. Creates `~/vibrance` and the import folder `~/vibrance/import` in it, then enters `~/vibrance`.
-2. Downloads `compose.yaml`, the description of the two containers, unless the folder already has one.
-3. Downloads `env.example` as `.env`, your settings file, unless the folder already has one. It makes `.env` readable by you only (`chmod 600`), then writes a random database password (`POSTGRES_PASSWORD`) and a random sign-in password (`MUSICLIB_PASSWORD`) into it, without printing them.
-4. Starts MusicLib. The first time, Docker downloads the images. The command returns when MusicLib reports that it is ready.
+### First start
 
-The block is safe to paste twice: it never replaces an existing `compose.yaml` or `.env`. Without the block, set `POSTGRES_PASSWORD` in `.env` before the first start: PostgreSQL reads it only once, and [The database password](#the-database-password) explains how to change it later. To keep MusicLib's data in a folder of your choice instead of Docker's storage, read [The data in a host folder](#the-data-in-a-host-folder) **before** you run the last line.
+After [preparing the release files](#prepare-the-release-files-do-not-start-yet) and making any changes to `.env`, start a new installation (not a restore target). Replace `~/vibrance` if you chose a different folder:
 
-What the block creates:
+```sh
+cd ~/vibrance && docker compose up -d --wait
+```
 
-- in `~/vibrance`: `compose.yaml`, `.env` and the empty folder `import`;
-- in Docker: the containers `musiclib` (the app) and `musiclib-db` (PostgreSQL 17), and the volumes `musiclib_db` (the database), `musiclib_data` (the originals and the library) and `musiclib_backup` (backups).
+The first time, Docker downloads the images and creates the containers `musiclib` (the app) and `musiclib-db` (PostgreSQL 17). The default volumes are `musiclib_db` (the database), `musiclib_data` (the originals and the library) and `musiclib_backup` (backups). The command returns when MusicLib reports that it is ready.
 
 Check that it works:
 
@@ -114,7 +139,7 @@ mkdir -p import
 docker compose up -d --build --wait
 ```
 
-- `COMPOSE_FILE=compose.dev.yaml` in `.env` makes every plain `docker compose` command, and the [maintenance scripts](#the-maintenance-scripts), use the source build. Run every command of this guide from the clone's folder, `vibrance-musiclib`, instead of `~/vibrance`, and add `--build` where this guide runs `docker compose up -d --wait` after changing the sources.
+- `COMPOSE_FILE=compose.dev.yaml` in `.env` makes every plain `docker compose` command, and the [`musiclib` maintenance command](#maintenance), use the source build. Run every command of this guide from the clone's folder, `vibrance-musiclib`, instead of `~/vibrance`, and add `--build` where this guide runs `docker compose up -d --wait` after changing the sources.
 - The first build compiles the pinned tools and takes several minutes.
 - `compose.dev.yaml` has the same database password default as `compose.yaml`.
 - A source build and a published-image installation are the same Compose project, `musiclib`, with the same containers and volumes: on one machine they share the same data.
@@ -241,10 +266,18 @@ library/
 - Names are cleaned up so that they also work on Windows filesystems: characters such as `/ \ : * ? " < > |` become `_`, and very long names are shortened. Two albums or tracks that would end up at the same path are reported as a conflict for you to resolve; nothing is dropped or renamed silently.
 - MusicLib writes the title, artist, album artist, album, track and disc numbers and totals, year, genre, compilation flag and cover into every track. Any other tag the files already had is kept as it is.
 - An album's folder is replaced as a whole: a program reading the library sees either the old or the new version of an album, never a half-written one.
-- `.musiclib.json` is a receipt that MusicLib uses to check its own output.
+- `.musiclib.json` is a receipt that MusicLib uses to check its own output. It describes the published build, not the current desired catalog.
 - Folders are created with mode `0755` and files with `0644`, owned by the user MusicLib runs as (uid 1000): every user of the machine can read them, and only MusicLib can write them.
 
 **Treat the library folder as read-only.** Change metadata in MusicLib, never in the library: see [Other programs and the library folder](#other-programs-and-the-library-folder).
+
+### Publication receipts
+
+New builds write receipt schema 2. The receipt records `store_id`, `album_id`, `build_id`, `album_revision`, `render_version` and an inventory of relative paths, sizes and `sha256` hashes of the published files. Each published audio track also carries its catalog `track_id` and `source_blob_sha256`, the hash of the immutable original. The published hash is computed independently from the finished, tagged file; use it to verify the library copy, not the source hash. Covers, lyrics and extra files have no track/source pair.
+
+Track IDs survive edits, moves and rerenders; deleting and re-adding a track gives it a new ID even if its bytes match. `store_id` identifies catalog lineage, not a unique running installation. [Restore](#restore-use-new-empty-destinations) preserves that lineage.
+
+MusicLib still reads canonical schema 1 receipts, which have no store or track provenance. Both formats are checked strictly, and recovery and doctor use the original receipt bytes for hash checks. A valid v2 receipt from another store is **foreign output**, not damage to this album's output, even if the album IDs match. Normal publication and recovery will not adopt or replace it. Inspect the path and mounts before moving foreign output aside. A bad or missing receipt cannot identify a pending build; damage at an already-owned path can be replaced by a normal render when no pending publication prevents it. Never edit or reformat a receipt by hand.
 
 ### Disk space
 
@@ -267,7 +300,7 @@ The data folder must be:
 
 Create it yourself: if it does not exist, Docker creates it owned by root, and MusicLib does not start. The backup folder (`MUSICLIB_BACKUP`) must be owned by uid 1000 too (a backup folder owned by root makes every backup fail), and must not be inside the data folder; put it on another disk if you can.
 
-1. Paste the [install block](#first-start) **without its last line** (`docker compose up -d --wait`).
+1. If you have not already done so, [prepare the release files](#prepare-the-release-files-do-not-start-yet). Enter the installation folder (`cd ~/vibrance` by default). Do not start the app yet.
 2. Create the two folders and check them:
 
    ```sh
@@ -278,19 +311,17 @@ Create it yourself: if it does not exist, Docker creates it owned by root, and M
    ```
 
    `mkdir -p` creates the folders, `chown` gives them to uid 1000, `findmnt` prints the filesystem type and `ls -A` lists every entry, hidden ones included.
-3. Add the two settings to `.env` and start:
+3. Add the two settings to `.env`:
 
    ```sh
    cat >> .env <<'EOF'
    MUSICLIB_DATA=/srv/musiclib/data
    MUSICLIB_BACKUP=/mnt/backup/musiclib
    EOF
-   docker compose up -d --wait
-   ls /srv/musiclib/data                          # library  originals  work
    ```
 
-   If the music you want to import is not in `~/vibrance/import`, add `MUSICLIB_IMPORT=/srv/music` too. The import folder must exist, and its files must be readable by uid 1000 (files readable by everyone are fine).
-4. Your library is at `/srv/musiclib/data/library`.
+   If the music you want to import is not in `~/vibrance/import`, set `MUSICLIB_IMPORT=/srv/music` in `.env` too. The import folder must exist, and its files must be readable by uid 1000 (files readable by everyone are fine).
+4. If preparing a restore target, [continue with restore](#restore-use-new-empty-destinations) without starting the app. Otherwise run `docker compose up -d --wait` from the installation folder. Your library is at `/srv/musiclib/data/library`.
 
 MusicLib keeps everything there: `originals/`, `library/`, `work/` and its marker files `.lock` and `.musiclib-store` (and `.maintenance` while a rebuild or restore runs). It never changes or deletes any other entry at the top of the folder, but it does not refuse a folder that already holds other files, so keeping it empty is up to you.
 
@@ -365,7 +396,7 @@ Other programs may **read** `library/`. They must **never write** in it: no tags
 - **A folder created where an album is about to go** (after a new title, for example) blocks that album's update: Activity shows it as failed with `publish_destination_occupied`, and `library/` is not touched. Move the folder away, then retry. MusicLib never adopts or deletes it.
 - **A program running as root** that leaves folders owned by root in `library/`, or changes owners there, stops MusicLib at that album's next update, or at its next start: the log shows a permission error (`publish_io` or `fs_permission`) and MusicLib restarts in a loop. Give the folder back with `sudo chown -R 1000:1000 /srv/musiclib/data` and run `docker compose restart app`: the update then completes. No album is lost in between.
 
-`doctor` lists each foreign file and folder as `doctor_output_extra`: a warning, not damage, so it still ends with "no damage found". Delete them by hand, or regenerate the whole folder with the offline [rebuild](#rebuild-regenerate-the-library-folder), which deletes everything in `library/` and renders every album again. **Rebuild the library folder** in Activity regenerates the album folders only.
+`doctor` reports untracked extra files as `doctor_output_extra`, a warning, not damage. A valid receipt for a different store at an expected album path is instead `doctor_foreign_output`: check the mounts and move that output aside after inspection. The offline [rebuild](#rebuild-regenerate-the-library-folder) deliberately clears the whole `library/` tree; **Rebuild the library folder** in Activity uses normal publication and regenerates album folders only.
 
 Give other programs read-only access: for a container, mount the library with `:ro`; for a network share, share it read-only. On many Linux desktops your own account is uid 1000 too (`id -u` prints `1000`), so the programs you run yourself can write there: set them not to change the files or folders of the library.
 
@@ -562,7 +593,7 @@ Any reverse proxy works if it:
 - leaves the other headers alone, in particular `Origin`, `Cookie`, `Set-Cookie`, `If-Match`, `ETag` and `X-Musiclib-Request`;
 - serves MusicLib at the root of its own name;
 - accepts large request bodies: a track can be 2 GiB, an extra file 256 MiB and a cover 20 MiB. nginx refuses bodies over 1 MB by default, and the upload then fails with "The server doesn't answer": set `client_max_body_size 0;`, MusicLib applies its own limits;
-- lets long transfers run. For nginx, `proxy_request_buffering off;` and `proxy_buffering off;` pass uploads and downloads through instead of storing them in temporary files, and a longer `proxy_read_timeout` and `proxy_send_timeout` (60 s by default) help large uploads over slow connections.
+- lets long transfers run. For nginx, `proxy_request_buffering off;` and `proxy_buffering off;` pass uploads and downloads through instead of storing them in temporary files, and a longer `proxy_read_timeout` and `proxy_send_timeout` (60 s by default) help large uploads over slow connections. For browser album creation, allow for the whole multipart body and for audio verification after the transfer. A proxy timeout does not prove that the album was not saved.
 
 Response compression is not needed. If you turn it on (Caddy's `encode`, nginx's `gzip`), the `ETag` header changes: the web interface is not affected, and API scripts should take the `etag` field of the JSON body instead of the header.
 
@@ -602,6 +633,17 @@ When an album needs attention, its row says why in a plain sentence, and **Detai
 
 The import reports are kept for 90 days, then deleted.
 
+### Creating an album in the browser
+
+1. Choose **Create album** in the sidebar. In **Tracks**, select or drop individual FLAC, MP3 or M4A (AAC or ALAC) files, not folders or ZIP archives. You can remove files or override a track's title, disc, number, artist or genre. Leave overrides blank for server-side inference from tags and filenames; **No genre** explicitly clears that track's genre.
+2. In **Album details**, select an existing artist or enter a name. MusicLib reuses an exact normalized name match (ignoring case and surrounding whitespace), keeping its spelling, or creates the artist with the album. Names that only collide as folder names are not merged. Enter an album title, optionally set year and genre, and choose whether it is a compilation. You can choose or drop a JPEG or PNG on the **Cover** square for a local preview. To replace it, drop another image or choose **Change cover**. If you skip the cover, MusicLib looks for embedded artwork. Add lyrics and extra files in the album editor after creation. The server accepts 1–1,000 tracks, up to 2 GiB each, and a cover up to 20 MiB and 40 megapixels that can be embedded in every track format. See the [creation API](#creating-an-album) for the full contract.
+3. Confirm with **Create album**. Until then, the draft and selected files live only in the tab: nothing is uploaded or saved, and reloading, closing or cancelling discards the draft. There is no resumable upload or tag preview before confirmation.
+4. The page shows when it is uploading and verifying. MusicLib fully checks the audio and then saves the whole album, including any new artist, at revision 1 in one transaction with a single render request. This is not a folder import and does not create an import report. After success the album page shows any warnings and the publication status. The library files are not ready until the queued render succeeds; follow it in **Activity**.
+
+A refused confirmation leaves no partial catalog album or new artist. You can correct the draft and submit again, which sends the files again. Originals already stored remain immutable and can be left unreferenced after failure or **Stop confirmation**; they are included in backups and are not cleaned up automatically.
+
+Stopping the request or losing the reply does not prove that the save failed. The page checks for the album using this draft's ID. If found, the page opens it so you can check what was saved. If the result is still unconfirmed, use **Retry this draft** rather than starting over. A same-ID conflict lets you open the existing album; it does not apply the retried fields.
+
 ### The Activity page
 
 **Activity** shows the work of MusicLib: scans, imports and library updates, in three groups:
@@ -628,25 +670,20 @@ A backup is a folder with the database dump (`catalog.dump`), a copy of every or
 
 ### Making a backup
 
-MusicLib must be stopped while a backup runs; PostgreSQL keeps running. From `~/vibrance`:
+From the installation folder, run one command:
 
 ```sh
-docker compose stop app
-docker compose run --rm --no-deps app backup --to "/backup/$(date +%F-%H%M)"
-docker compose start app
+./musiclib backup                # e.g. /backup/2026-09-29T213045Z (UTC)
+./musiclib backup before-upgrade # or choose a name, quoted if it has spaces
 ```
 
-- The first line stops MusicLib (the app only).
-- The second runs the offline `backup` command in a one-off container. `$(date +%F-%H%M)` names the backup after the date and time, such as `2026-09-29-2130`. It prints `Backup completed: /backup/2026-09-29-2130` and exits with 0.
-- The third starts MusicLib again.
-
-When MusicLib runs from a clone of the repository, `scripts/backup.sh 2026-09-29-2130` does the same three steps: see [The maintenance scripts](#the-maintenance-scripts).
+Use one line, not both. PostgreSQL must already be running and healthy. MusicLib is unavailable during the backup and you are signed out if the app restarts. The command waits for a previously running app to become ready after the backup succeeds. A previously stopped app stays stopped. If only startup fails, the backup is complete: inspect the app logs rather than making the same backup again. For 1.2.0 and older releases without the command, see [Manual backup and restore](#manual-backup-and-restore).
 
 What to know:
 
 - The backup is a new folder under `/backup`, the backup folder (`MUSICLIB_BACKUP`). It is a full copy, and every original is verified while it is copied.
 - It **never overwrites**: a name that already exists is refused (`backup_exists`).
-- **The destination is always a new folder under `/backup/`**, the backup folder, written as a plain absolute path such as `/backup/2026-09-29-2130` (a folder inside an existing subfolder, such as `/backup/old/2026-09-29-2130`, works too). Any other path, such as `/tmp/…`, would be inside the one-off container and lost with it, so `backup` refuses it before doing anything (`backup_outside_backup`, exit 2). So does `/backup` itself, and a path with `.` or `..`, a trailing slash or a double slash.
+- Give `./musiclib` a single directory name, not a path. It refuses `.` and `..`, path separators, and names beginning `.musiclib-backup-` before doing anything. A timestamp collision is refused like any other existing name.
 - The backup is written under a temporary name, `.musiclib-backup-….tmp`, and renamed to its final name only when it is complete. A backup that fails after it started writing leaves that temporary folder: inspect it and delete it yourself; MusicLib never deletes it. Never use a temporary folder as a backup.
 - A backup folder that MusicLib cannot write (for example a host folder owned by another uid) is refused (`fs_permission`, exit 2) before anything is written.
 - `MUSICLIB_BACKUP` must not be inside `MUSICLIB_DATA` on the host either. Backup and restore compare the filesystem and folder behind both mounts and refuse a nested destination (`backup_destination`, exit 2). The check sees bind mounts of one host filesystem, but not through a network share or a second filesystem mounted over the data folder, so keep the two host paths plainly separate.
@@ -661,25 +698,14 @@ A restore puts a backup into a **new, empty installation**: a new, empty databas
 
 "Empty" means: a database with no tables, sequences or views in its schema (not even MusicLib's migration table), and a data folder with no entries except `.lock` and an empty `lost+found` folder (at the root of an ext4 disk).
 
-1. On the new machine, or in a new folder, paste the [install block](#first-start) **without its last line**.
-2. In `.env`, set `MUSICLIB_BACKUP` to the host folder that contains your backup, such as `/mnt/backup/musiclib` (and `MUSICLIB_DATA` to a new empty folder, if you keep the data in a [host folder](#the-data-in-a-host-folder)).
-3. Run:
+1. On the new machine or in a new folder, [prepare the release files](#prepare-the-release-files-do-not-start-yet), then enter that folder. **Do not run the first-start block.** If restoring a source build, build its app image first with `docker compose build app` without starting it.
+2. In `.env`, set `MUSICLIB_BACKUP` to a location containing the completed archive (for example `/mnt/backup/musiclib`). If you use `MUSICLIB_DATA`, point it to a new empty [host folder](#the-data-in-a-host-folder). On a machine with an existing installation, [isolate the restore project](#restoring-next-to-an-existing-installation) before running any startup or restore command.
+3. For 1.2.0 and older releases without `musiclib`, use the [manual restore](#manual-backup-and-restore) instead. Otherwise run `./musiclib restore before-upgrade`, replacing `before-upgrade` with the exact backup directory name. The command refuses a running app, starts only PostgreSQL, and runs the offline restore. It starts the app and waits for readiness only once the restore succeeds. Starting the app before restore would initialize the empty destinations.
+4. Check Activity: readiness does **not** mean the regenerated library is complete. When Activity is idle, run `./musiclib doctor --deep`.
 
-   ```sh
-   docker compose up -d --wait postgres
-   docker compose run --rm --no-deps app restore --from /backup/2026-09-29-2130
-   docker compose up -d --wait
-   curl -f http://127.0.0.1:8080/health/ready
-   ```
+If the command reports that the catalog and originals are restored but the app could not become ready, troubleshoot startup; **do not restore again into the now-populated destinations**. Releases without `musiclib` can use the [manual procedure](#manual-backup-and-restore).
 
-   - The first line starts **only PostgreSQL**, never the app: the first start of the app would initialize the empty data folder, and the restore would then refuse it.
-   - The second restores the backup. It verifies the whole backup before writing anything, then prints `Restore completed. Start the app to render active albums.` and exits with 0.
-   - The third starts MusicLib (it creates the app's container if needed), which regenerates the library folder by itself. Activity shows the progress.
-4. When Activity is idle, run a deep check: `docker compose stop app && docker compose run --rm --no-deps app doctor --deep`, then `docker compose start app`.
-
-When the new installation runs from a clone of the repository, `scripts/restore.sh 2026-09-29-2130` can run the second step ([The maintenance scripts](#the-maintenance-scripts)); it does not start the app.
-
-The restored catalog and originals keep their identities, and all published output is regenerated. Keep the backup unchanged during the restore: a change between its verification and the database restore can leave the destinations unusable.
+Restore preserves the backup's store, album and track IDs and all original bytes, including unreferenced originals. It resets publication state and regenerates the library with the restoring version's renderer. Two restores of the same backup share lineage even if they later diverge: keep their databases and data mounts separate; a matching store ID does not make them interchangeable. Keep the backup unchanged during the restore: a change between its verification and the database restore can leave the destinations unusable.
 
 **If the restore fails**, its exit code and log line say which case you are in:
 
@@ -693,7 +719,7 @@ A backup made before schema 3 (by a development version older than 1.0.0) restor
 
 ### Restoring next to an existing installation
 
-To restore on a machine that still runs an installation (to test a backup, for example), use a second folder with its own `compose.yaml` and `.env`, such as `~/vibrance-restore`: paste the install block without its last line, with `~/vibrance` replaced by `~/vibrance-restore`. `compose.yaml` fixes the Compose project name, `name: musiclib`: in a second folder the same name would select the **existing** installation's containers and volumes, so every command there would act on it. Three settings in the new folder's `.env` keep the two apart:
+To restore on a machine that still runs an installation (to test a backup, for example), use a second folder with its own `compose.yaml` and `.env`, such as `~/vibrance-restore`: use that path for `dir` when you [prepare the release files](#prepare-the-release-files-do-not-start-yet). Do not start any containers. `compose.yaml` fixes the Compose project name, `name: musiclib`: in a second folder the same name would select the **existing** installation's containers and volumes, so every command there would act on it. Three settings in the new folder's `.env` keep the two apart:
 
 1. **Its own project name.** `COMPOSE_PROJECT_NAME` overrides `name:`; the new project gets its own containers (`musiclib-restore`, `musiclib-restore-db`) and volumes (`musiclib-restore_db`, `musiclib-restore_data`, `musiclib-restore_backup`). Check it before any other command:
 
@@ -721,7 +747,7 @@ To restore on a machine that still runs an installation (to test a backup, for e
 
    If the existing installation keeps its backups in a host folder (`MUSICLIB_BACKUP`), copy from there.
 
-Then run the restore commands of the previous section in `~/vibrance-restore`, and open `http://127.0.0.1:8081` (in a private window: the two installations share the browser's sign-in cookie). The two installations share nothing and can run side by side. When you are done with the test, `docker compose stop` in `~/vibrance-restore` stops it.
+Check that both database and data mounts are distinct from the old installation. If you use `MUSICLIB_DATA` or override the database mount, changing just the project name is not enough. Then run `./musiclib restore NAME` (or the [manual restore](#manual-backup-and-restore) for 1.2.0) in `~/vibrance-restore` and open `http://127.0.0.1:8081` (in a private window: the two installations share the browser's sign-in cookie). The command does not switch traffic or change the old installation. When you are done with the test, `docker compose stop` in `~/vibrance-restore` stops it.
 
 ### Moving to another machine
 
@@ -769,25 +795,41 @@ Add the password as above and run `docker compose up -d --wait` again. A `.env` 
 
 ### Upgrading the published image
 
-```sh
-cd ~/vibrance
-docker compose stop app &&
-docker compose run --rm --no-deps app backup --to "/backup/before-update-$(date +%F-%H%M)" &&
-curl -fsSLO https://github.com/tommasonovelli/vibrance-musiclib/releases/latest/download/compose.yaml &&
-docker compose pull && docker compose up -d --wait
-docker compose run --rm --no-deps app version
-```
+1. Make a successful backup with the **currently running version** (`./musiclib backup` or the [manual procedure](#manual-backup-and-restore) for 1.2.0 and older). Do not proceed if that backup failed.
+2. Pick an explicit release tag. For a release that lists both `compose.yaml` and `musiclib` as assets, substitute that tag for `vX.Y.Z` below. Both downloads must finish before either installed file is replaced. For an older release without `musiclib`, download only its `compose.yaml`, also using a temporary file, and use the manual procedure.
 
-- The commands are chained with `&&`: if the backup fails, nothing is updated, and MusicLib stays stopped until you fix the cause (`docker compose start app` restarts the old version).
-- `curl` replaces `compose.yaml` with the latest release's. Your settings are in `.env`, which stays. If you changed the database password in `compose.yaml` instead of `.env`, move it to `.env` first: the new file comes with the default.
-- `docker compose pull` downloads the new images; `docker compose up -d --wait` recreates the app on them and keeps the volumes.
-- The last line prints the running version.
+   ```sh
+   (
+     set -e
+     cd ~/vibrance
+     tag=vX.Y.Z
+     base="https://github.com/tommasonovelli/vibrance-musiclib/releases/download/$tag"
+     tmp=$(mktemp -d .musiclib-download.XXXXXX)
+     trap 'rm -rf -- "$tmp"' EXIT
+     curl -fsSL -o "$tmp/compose.yaml" "$base/compose.yaml"
+     curl -fsSL -o "$tmp/musiclib" "$base/musiclib"
+     chmod 644 "$tmp/compose.yaml"
+     chmod 755 "$tmp/musiclib"
+     mv -f -- "$tmp/compose.yaml" compose.yaml
+     mv -f -- "$tmp/musiclib" musiclib
+     docker compose pull
+     docker compose up -d --wait
+   )
+   ```
 
-Instead of downloading a new `compose.yaml`, you can change the version on the app's `image:` line by hand: it is the only place that names it. Never use a floating tag such as `latest`.
+   Keep `.env`. If you changed the database password in `compose.yaml` instead of `.env`, move it to `.env` first. Compose recreates changed containers and keeps their volumes. Use [the version command](#showing-the-version) to verify the new version. Do not use a floating image tag such as `latest`.
 
-At its first start the new version applies its database migrations, before any work starts. If its `render_version` changed, it queues a new render of every active album; failed renders are not retried silently. Check Activity, then run [doctor](#doctor-check-the-library).
+On first start the new version applies any database migrations and recovers pending publications before starting workers. A changed `render_version` queues active albums with stale output through the normal render queue; existing failed jobs stay failed until retried. Check **Activity** for waiting, running and failed renders, resolve any failures and run [doctor](#doctor-check-the-library) after the queue drains. Readiness alone does not mean the library is current.
 
-**Downgrading is not possible**: an older version refuses a database that a newer one has upgraded (`store_schema_too_new`). To go back, restore the backup made before the upgrade, using the older version.
+### From 1.2.0 to receipt schema 2
+
+Make the pre-upgrade backup with the [manual 1.2.0 procedure](#manual-backup-and-restore). Plan time for complete rerenders, not just server startup. On the data filesystem leave room to stage complete albums alongside their current published copies, including concurrent work and the [1 GiB safety margin](#disk-space).
+
+On upgrade, pending v1 publications are recovered as recorded before new renders are queued. Old and new receipts can coexist while work drains. Normal whole-album renders replace the receipts and output together; trashed albums get v2 output when restored and rendered. There is no in-place receipt edit, reimport or cleanup of originals, including unreferenced ones.
+
+### Rolling back an upgrade
+
+Do not switch to an older app image over the upgraded database and data. An older binary may refuse the schema (`store_schema_too_new`) or not recognize newer receipts. To roll back, use the older release's files and [restore a compatible pre-upgrade backup into a fresh environment](#restore-use-new-empty-destinations), with a new empty database and data volume or folder. Use the manual restore path for 1.2.0. This recovers the catalog as of that backup, preserves its lineage and regenerates output with the older renderer. Keep the upgraded installation intact until the restored one has been checked.
 
 ### Upgrading a source build
 
@@ -802,40 +844,17 @@ With `COMPOSE_FILE=compose.dev.yaml` in `.env`, this rebuilds the app from the n
 
 ## Maintenance
 
-Four offline commands check, repair the output of, save and restore an installation: `doctor`, `rebuild`, `backup` and `restore`. They are subcommands of the app's image, run in a one-off container with `docker compose run --rm --no-deps app …`.
+Use `./musiclib --help` for the four offline commands. [Backup and restore](#backups-restore-and-moving) preserve the catalog and originals; rebuild only regenerates output, and doctor checks without repairing. All four take the exclusive `/data/.lock` inside the container. They do not need the sign-in password; normal app startup does.
 
-| Command | What it does | Changes |
-|---|---|---|
-| `doctor` | checks the originals, the library and the catalog | nothing (it only reads) |
-| `doctor --deep` | the same, and also reads every original and every library file against its hash | nothing |
-| `rebuild --store-id UUID` | deletes and regenerates the library folder and `work/` | `library/`, `work/` and the publication state |
-| `backup --to /backup/NAME` | writes a new, verified backup | a new folder in `/backup` |
-| `restore --from /backup/NAME` | restores a backup into a new, empty installation | the empty database and data folder |
-| `version` | prints the version and `render_version` | nothing |
-
-Rules for all of them except `version`:
-
-- **The app must be stopped; PostgreSQL must be running.** Each command takes the lock on `/data/.lock` and refuses at once (`volume_locked`) if the app or another command holds it.
-- `doctor`, `rebuild` and `backup` never migrate the database: after an upgrade, start the app once so that it applies the migrations, stop it, then run the command.
-- They do not need the sign-in password.
-- Exit codes: **0** success (for doctor: no damage), **1** damage found or an operation that failed (logged with its `code` and an `advice` field), **2** refused before doing anything, or invalid arguments (nothing written except `.lock`), or an incomplete or foreign `.maintenance` marker.
-- Start the app again only after exit 0. After doctor's exit 1, read the findings first. After a failed `rebuild`, `backup` or `restore`, leave the app stopped and read [Errors of the maintenance commands](#errors-of-the-maintenance-commands).
-
-The pattern, by hand:
-
-```sh
-docker compose stop app
-docker compose run --rm --no-deps app doctor --deep
-docker compose start app
-```
+- Backup, rebuild and doctor require an already healthy PostgreSQL service. They never migrate the database; after an upgrade start the app once to apply migrations before using them. They restart the same app container after confirmed success only if it was running before. Doctor also permits this after exit 1 **with the completed findings summary**; read its findings. If that summary cannot be confirmed, the app stays stopped and the coordination directory and offline container are kept for investigation.
+- Restore starts PostgreSQL if needed, but never stops a running app or starts the app before restore succeeds. The offline engine checks the empty destinations.
+- Confirmed offline codes are preserved: **0** success, **1** failure (or doctor findings), **2** refusal or invalid usage. **3** is a host-command failure or startup failure after a successful offline result. The reported offline result and readiness are separate. After a failure, read the output and [maintenance errors](#errors-of-the-maintenance-commands) before starting or retrying.
 
 ### doctor: check the library
 
 ```sh
-docker compose stop app
-docker compose run --rm --no-deps app doctor              # quick: presence and sizes
-docker compose run --rm --no-deps app doctor --deep       # full: reads and hashes every file
-docker compose start app
+./musiclib doctor           # quick: presence and sizes
+./musiclib doctor --deep    # full: reads and hashes every file
 ```
 
 - Without `--deep`, doctor checks that every original and every library file exists with its expected size, the path reservations, the receipts and the expected output. It is quick.
@@ -853,64 +872,59 @@ What each finding means: [Errors of the maintenance commands](#errors-of-the-mai
 It asks for the store id, the UUID that pairs the data folder with its database, so that it never runs on the wrong installation by mistake:
 
 ```sh
-docker compose stop app
 docker compose run --rm --no-deps --entrypoint cat app /data/.musiclib-store
 ```
 
-The second line prints the data folder's marker, such as `store_id=0b6f2c1e-8a4d-4f7e-9c3b-2d1e5a6f7b8c`. Copy the UUID after `store_id=`, without the prefix, and pass it to `rebuild`:
+This read-only command prints the data folder's marker, such as `store_id=0b6f2c1e-8a4d-4f7e-9c3b-2d1e5a6f7b8c`. Copy the UUID after `store_id=`, without the prefix, and pass it to `rebuild`:
 
 ```sh
-docker compose run --rm --no-deps app rebuild --store-id '0b6f2c1e-8a4d-4f7e-9c3b-2d1e5a6f7b8c'
-docker compose start app
+./musiclib rebuild --store-id '0b6f2c1e-8a4d-4f7e-9c3b-2d1e5a6f7b8c'
 ```
 
 - Pass the UUID exactly as printed, in lowercase: anything else is refused as invalid usage (exit 2). It must match both the marker and the database; otherwise the rebuild refuses (`rebuild_store_id`, exit 2) and deletes nothing.
-- On success it prints `Rebuild prepared. Start the app to render active albums; originals and catalog were kept.` Starting the app renders every album again; Activity shows the progress.
+- On success, a previously running app is restarted automatically. If it was already stopped (including after an earlier failed rebuild), start it once the rebuild succeeds. Activity shows the render progress.
 - **An interrupted or failed rebuild leaves `/data/.maintenance`**, which blocks the start of the app. Never delete it: run exactly the same rebuild command again, with the same store id, until it succeeds.
 - Rebuild is not a backup: it regenerates output only.
 
 **Rebuild the library folder** in Activity (Advanced) is the lighter, online variant: it writes every album's folder again while MusicLib runs, and leaves other files in `library/` alone.
 
-### The maintenance scripts
+### Which installation the command uses
 
-The repository has four wrapper scripts in `scripts/`. Each one stops the app, runs one offline command, and starts the app again when that is safe. They are **not part of a release**: they exist only in a clone of the repository.
+Put `musiclib` next to the installation's Compose file and `.env`. The script uses that folder, even when called from elsewhere, and lets Compose resolve `.env` and `COMPOSE_FILE`. Run it on the Docker host (or on the local Docker Desktop machine), not against a remote Docker context or a forwarded socket. The source checkout's `scripts/backup.sh`, `restore.sh`, `doctor.sh` and `rebuild.sh` delegate to the same command; the last still takes a positional store UUID.
 
-**Where they act.** A script runs `docker compose` in the clone's folder, on the Compose file and `.env` there: `compose.yaml` and its published image, or the file named by `COMPOSE_FILE` (from the environment or from `.env`), such as `compose.dev.yaml` for a source build, so that the offline command runs the same image as the server. **Use them only when your installation runs from that clone's folder.** For an installation in `~/vibrance`, run the commands by hand in `~/vibrance`, as shown above.
+The command checks both existing containers, even when stopped. It refuses containers from a different folder and mismatches in the resolved service configuration, image IDs and mounts; it does not recreate services to reconcile drift. Check the intended project and settings before retrying. The automation supports the supplied Compose layout: one app and one database on the default Compose bridge, with bind mounts or project-owned local named volumes without custom driver options. Older Compose volumes and networks may lack resource hashes; this is not a reason to recreate storage. Their ownership labels and actual metadata must still match. Service configuration hashes must match separately; if a client upgrade changes them, use the matching Compose client or [the manual procedure](#manual-backup-and-restore) after verifying the images and mounts. For other layouts that cannot be verified, review the actual mounts and use the advanced procedure deliberately instead.
 
-A clone next to an installation in `~/vibrance` names the same Compose project, `musiclib`, but not its `.env`: a script run there would stop your app and run the command with other settings (another data folder, the default database password). So, before stopping anything, every script checks the folder that Docker records in each container of the project's `app` and `postgres` (the label `com.docker.compose.project.working_dir`). If a container was created in another folder, or in a folder this shell cannot see, the script stops, exits 1, and prints the commands to run by hand instead, for example:
+### If maintenance was interrupted
 
-```text
-doctor.sh: error: the Compose project of this clone (/home/you/src/vibrance-musiclib) already has containers created from /home/you/vibrance, which has its own compose.yaml and .env (a folder this shell cannot see counts as another one). Nothing was stopped. Run the commands by hand in the installation's folder (docs/operations.md, "Maintenance"):
-  cd /home/you/vibrance
-  docker compose stop app
-  docker compose run --rm --no-deps app doctor --deep
-  docker compose start app    # after exit 0 or 1
+Only one `musiclib` command can run in an installation folder at a time. Do not edit Compose settings or run manual Docker lifecycle commands alongside it. `.musiclib-command.lock` is local coordination, **not** the data-volume lock. On interruption or when Docker cannot confirm the result, the command leaves that directory and sends no new start request. A start already requested after confirmed offline success may still finish. It does not stop a one-off that may still be finishing. The offline container's logs are displayed on normal completion, or can be inspected in Docker during investigation.
+
+From the installation folder and on the same Docker context:
+
+1. Read `.musiclib-command.lock/owner`. Check that the original invocation is no longer active; the PID alone is not proof (PIDs can be reused).
+2. Run `docker compose ps -a app postgres`. Look for the `<project>-musiclib-offline` container. Use `docker container inspect --format '{{json .State}}' CONTAINER` and `docker container logs CONTAINER` to verify the state and result. Do not clear anything while an offline process might still be running or Docker is unreachable. If it exited, keep the logs; remove only that stopped one-off container (`docker container rm CONTAINER`, without `-v`) when no longer needed. Do not assume that an absent container proves success; verify any completed archive or restore separately.
+3. Once the invocation is gone and you have established that no offline operation is still running, remove only the local coordination files with `rm -- .musiclib-command.lock/owner && rmdir -- .musiclib-command.lock`. If interruption happened before `owner` was created, use `rmdir` on the empty directory. Follow the operation-specific recovery advice before starting the app. **Never remove `/data/.lock` or `/data/.maintenance` by hand.**
+
+### Manual backup and restore
+
+For older releases without `musiclib`, use these steps instead. First check that Compose selects the intended containers, images and mounts. These commands bypass host coordination. Keep the app stopped during offline work; use the engine's diagnostics and verify completion before restarting. A Docker error or lost connection is not a confirmed offline exit.
+
+For backup, require healthy PostgreSQL, note whether the app is running, and stop only the app if needed:
+
+```sh
+docker compose stop app &&
+docker compose run --rm --no-deps app backup --to "/backup/$(date -u +%Y-%m-%dT%H%M%SZ)"
 ```
 
-When the project has no `app` or `postgres` container yet, the check passes.
+Only after a confirmed exit 0, and only if the app was running, use `docker compose start --wait app`. After a failed backup inspect the cause, confirm no offline work is running, and choose a new name if a completed archive already exists.
 
-What every script does, in order:
+For restore, prepare [new empty destinations](#restore-use-new-empty-destinations), and do not start the app first:
 
-1. Checks that `docker` and `docker compose` work and that the Docker daemon answers.
-2. Checks its arguments; a wrong use prints `usage: …` (or, for `rebuild.sh`, `STORE_ID must be …`) and exits 1 without touching anything.
-3. Checks that the project's containers were created in the clone's folder, as above; otherwise it exits 1 without touching anything.
-4. Notes whether the app is running, then stops it (`stopping app (PostgreSQL remains up)`); PostgreSQL keeps running.
-5. Runs the offline command (`running offline doctor`, for example) with `docker compose run --rm --no-deps app …`.
-6. Starts the app again (`starting app again`) only if it was running before and the command exited 0, or, for doctor only, 1 (findings). Otherwise it prints `offline command exited N; app remains stopped; inspect the logs before starting it` and leaves the app stopped.
+```sh
+docker compose up -d --wait postgres &&
+docker compose run --rm --no-deps app restore --from /backup/before-upgrade
+```
 
-The script exits with the command's exit code (0, 1 or 2, as above).
-
-| Script | Syntax | Runs | Example |
-|---|---|---|---|
-| `scripts/doctor.sh` | `scripts/doctor.sh [--deep]` | `doctor`, or `doctor --deep` | `scripts/doctor.sh --deep` |
-| `scripts/rebuild.sh` | `scripts/rebuild.sh STORE_ID` | `rebuild --store-id STORE_ID` | `scripts/rebuild.sh 0b6f2c1e-8a4d-4f7e-9c3b-2d1e5a6f7b8c` |
-| `scripts/backup.sh` | `scripts/backup.sh BACKUP_NAME` | `backup --to /backup/BACKUP_NAME` | `scripts/backup.sh 2026-09-29-2130` |
-| `scripts/restore.sh` | `scripts/restore.sh BACKUP_NAME` | `restore --from /backup/BACKUP_NAME` | `scripts/restore.sh 2026-09-29-2130` |
-
-- `doctor.sh` takes no argument or exactly `--deep`.
-- `rebuild.sh` takes exactly one argument, the store id: read it first with `docker compose run --rm --no-deps --entrypoint cat app /data/.musiclib-store`, and pass the UUID after `store_id=` exactly as printed. Anything that is not a lowercase UUID prints `rebuild.sh: error: STORE_ID must be the UUID after store_id= in /data/.musiclib-store, exactly as printed, in lowercase: nothing was stopped` and exits 1 before the app is stopped.
-- `backup.sh` and `restore.sh` take exactly one backup name: a single folder name under `/backup`, not `.` or `..`, with no `/`. Quote a name with spaces (`scripts/backup.sh '2026-09-29 full'`).
-- `restore.sh` is for a new, empty installation where only PostgreSQL runs (`docker compose up -d --wait postgres` first). The app was not running, so the script does not start it: run `docker compose up -d --wait` after exit 0.
+Only after confirmed exit 0, run `docker compose up -d --wait app`. Check Activity and run a deep doctor when rendering is complete. For manual doctor or rebuild use `docker compose run --rm --no-deps app doctor --deep` or `docker compose run --rm --no-deps app rebuild --store-id UUID` while the app is stopped. Restart a previously running app only after confirmed exit 0 (or doctor's exit 1 with the completed findings summary above, after reading its findings).
 
 ### Showing the version
 
@@ -945,7 +959,7 @@ When MusicLib refuses to start, the process exits and Docker starts it again (`r
 | `docker compose up` fails with a mount error for `import` | the import folder does not exist; Compose does not create it | `mkdir -p ~/vibrance/import`, or fix `MUSICLIB_IMPORT` |
 | `volume_permission` | the data folder is not owned by uid 1000 | `sudo chown -R 1000:1000 /srv/musiclib/data`, then `docker compose restart app` |
 | An upload fails with 507 `insufficient_space` | not enough free space beyond the 1 GiB margin | free space on the data disk, then retry |
-| An album stays in **Needs attention** with `publish_destination_occupied` | a folder that MusicLib did not create is where the album must go | move that folder out of `library/`, then retry |
+| An album stays in **Needs attention** with `publish_destination_occupied` or `publish_foreign_output` | the target is occupied, or a folder belongs to another store or album | verify the mounts and inspect the conflicting folder; move it aside before retrying, without editing its receipt |
 
 ### What MusicLib does when it starts
 
@@ -1016,6 +1030,7 @@ Each code appears in the command's log line, with an `advice` field for failures
 | `restore_schema_too_new`, `restore_schema_unsupported` (exit 2) | the backup was made by a newer version, or by one this version cannot restore | use a version at least as new as the one that made the backup |
 | `restore_dump_failed`, `restore_migrate`, `restore_store_id`, `restore_catalog_blob_missing`, `restore_catalog_blob_size`, `restore_blob_mismatch`, `restore_database_check`, `restore_schema` (exit 1) | the restore failed; read the advice | if it says `.maintenance` blocks the start: create **both** new empty destinations and restore again (from another backup if it fails again) |
 | `doctor_receipt_hash`, `doctor_receipt_invalid`, `doctor_receipt_unreadable`, `doctor_output_hash`, `doctor_output_size`, `doctor_output_missing` | a library file or receipt is damaged or missing | render the album again (**Update in library**) or [rebuild](#rebuild-regenerate-the-library-folder) after reviewing the findings |
+| `doctor_foreign_output` | a valid v2 receipt names a different store | verify the intended mounts and inspect the foreign output before moving it out of the way; do not edit its receipt |
 | `doctor_output_type`, `doctor_output_extra`, `doctor_originals_extra`, `doctor_unreadable` | an unexpected or unreadable entry | inspect the named path by hand; doctor never follows symbolic links and never deletes |
 | `doctor_claim_invalid`, `doctor_claim_missing`, `doctor_claim_collision`, `doctor_invalid_path`, `doctor_published_state`, `doctor_album_no_tracks`, `doctor_missing_blob`, `doctor_missing_album` | the catalog is inconsistent | keep the app stopped, back up the evidence and investigate; rebuild resets reservations and publication state only |
 | `doctor_blob_damaged`, `doctor_blob_hash` | an original is damaged | restore a good copy of it from a backup; rebuild cannot fix it |
@@ -1024,7 +1039,7 @@ Each code appears in the command's log line, with an `advice` field for failures
 
 ## The API
 
-Everything the interface does is also available through a JSON HTTP API under `/api`. This section shows it with `curl`, from the folder that holds `.env`. `<id>`, `<revision>`, `<track>`, `<attachment>` and `<job>` stand for the values the API returns.
+Everything the interface does is also available through a JSON HTTP API under `/api`, with multipart and raw-file upload endpoints. This section shows it with `curl`, from the folder that holds `.env`. `<id>`, `<revision>`, `<track>`, `<attachment>` and `<job>` stand for the values the API returns.
 
 ### Rules for every request
 
@@ -1032,7 +1047,7 @@ Everything the interface does is also available through a JSON HTTP API under `/
 - **`Origin`**, if sent, must be exactly `PUBLIC_ORIGIN` (`403 origin_not_allowed`). `curl` sends none.
 - **A session.** Without a live session every `/api` request answers `401 login_required`, and every page redirects (`303`) to `/login`. Only `/login`, `/logout`, `/static/*` and the health endpoints answer without one.
 - **`X-Musiclib-Request: 1`** is required on every request other than GET and HEAD (`403 request_header_required`), except the two plain HTML forms `POST /login` and `POST /logout`, which keep the `Host` and `Origin` checks.
-- **`If-Match`** with the `ETag` you just read is required on every change of an existing album or artist, covers, extra files, lyrics, tracks, trash and manual renders included: `428 precondition_required` without it, `412 precondition_failed` if someone changed it in between (read it again and redo the change). Creating an artist, starting an import, `POST /api/render-all`, `POST /api/trash/empty` and the job actions take no `If-Match`. Moving tracks takes the `If-Match` of the album they leave only; the album they go to gets a new revision too.
+- **`If-Match`** with the `ETag` you just read is required on every change of an existing album or artist, covers, extra files, lyrics, tracks, trash and manual renders included: `428 precondition_required` without it, `412 precondition_failed` if someone changed it in between (read it again and redo the change). Creating an artist or album, starting an import, `POST /api/render-all`, `POST /api/trash/empty` and the job actions take no `If-Match`. Moving tracks takes the `If-Match` of the album they leave only; the album they go to gets a new revision too.
 - **JSON bodies**: `Content-Type: application/json`, 16 MiB at most, no unknown or duplicate keys, every field present (`null` where allowed).
 - **Errors** are `{"code": …, "message": …, "details": …}` with a stable `code`.
 - No CORS header is ever sent, and every response has `X-Content-Type-Options: nosniff`.
@@ -1080,6 +1095,27 @@ curl -s -b "$J" -X POST "$O/api/trash/empty" -H 'X-Musiclib-Request: 1'         
 - An artist left without any album, trashed ones included, by a save that moves its last album elsewhere is deleted by that save. `POST /api/artists` creates an artist without an album; it stays until an album arrives and leaves it.
 - **Emptying the trash** (`POST /api/trash/empty`, no body, no `If-Match`) deletes from the catalog every trashed album whose removal from the library folder is complete, and answers `200` with how many were `deleted` and how many are `waiting` (their removal is still queued, running or failed). The originals stay; a deleted album answers `404 album_not_found`, and its import jobs keep their report with `result_album_id` `null`.
 - Each track of `GET /api/albums/<id>` carries `duration_ms`, its duration in milliseconds, or `null` while unknown: read-only, not a field of the PUT body.
+
+### Creating an album
+
+`POST /api/albums` requires a session and `X-Musiclib-Request: 1`, but no `If-Match`. Send `multipart/form-data` with a boundary. The first part must be `metadata`, without a filename, with no part `Content-Type` or `application/json`. It contains one JSON object (at most 8 MiB, maximum nesting depth 16). Unknown and duplicate keys are rejected; omit optional fields rather than sending `null`.
+
+| JSON field | Value |
+|---|---|
+| `creation_id` | Required canonical lowercase non-nil UUID; becomes the album ID. Keep it for checking an uncertain reply. |
+| `artist_id` or `artist_name` | Exactly one: an existing artist's canonical lowercase non-nil UUID or a name to reuse by exact normalized match or create with the album. |
+| `title` | Required album title. The chosen artist and title take precedence over embedded album tags. |
+| `year`, `genre`, `compilation` | Optional integer (1–9999), string and boolean respectively. Omitted values use import inference. |
+| `tracks` | Required array of 1–1,000 declarations. Each has `part_id`, `name`, `size`, and optionally `title`, `disc` (1–99), `number` (1–999), `artist` or `genre`. `title`, `artist` and `genre` are strings; `genre: ""` explicitly means no track genre. Unspecified overrides use import inference. Explicit numbers reserve positions within each disc; fallback numbering uses natural filename order, not multipart order. |
+| `cover` | Optional declaration with only `part_id`, `name`, `size`. Without it, MusicLib looks for compatible embedded art in final track order. |
+
+After `metadata`, send each declared file once, in any order. Use `Content-Disposition: form-data` with literal `name` equal to its `part_id` and `filename` matching its declared `name` (browser `%22` spelling for a quote is also accepted). Do not send `Content-Transfer-Encoding`. Part IDs are unique across the request, 1–64 ASCII letters, digits, `_` or `-`, and cannot be `metadata`. Filenames are single UTF-8 components of 1–255 bytes, not `.` or `..`, with no separators or control characters. Track filenames must be distinct. `size` is a positive integer byte count and must equal the actual part length. Only the declared audio and optional cover are accepted, not attachments, lyrics, blob references or client-supplied hashes.
+
+Audio must be FLAC, MP3 or M4A (AAC or ALAC). Track and cover limits are the same as for [individual uploads](#covers-extra-files-lyrics-and-tracks). Album and track text is normalized and limited to 1,024 characters, without control characters. The server checks actual bytes, including for chunked requests. The total body limit after reading metadata is the sum of the declared file sizes plus the actual metadata bytes plus 16 KiB × (number of declared files + 2) for multipart overhead; headers are bounded separately. Content, final genres and cover compatibility are verified before the catalog transaction.
+
+- **`201 Created`**: `Location: /api/albums/<creation_id>`, strong `ETag: "album:<creation_id>:1"`, and the album representation with a `warnings` array (each entry has `code`, `message` and optional `path`). The full catalog album and one render job are committed, not the published files. Check `GET /api/albums/<id>/status` for publication.
+- **Refusals** include `415 unsupported_media_type`, `413 body_too_large`, `400 upload_incomplete` for interrupted reads, `422 invalid_multipart` for malformed structure or mismatched declarations, and `422` for invalid fields or media. A missing selected artist is `404 artist_not_found`. Duplicate audio bytes within the submission (`track_exists`) and catalog name/path conflicts are `409`; lack of space is `507 insufficient_space`. A refused submission leaves no partial catalog changes; already stored originals may remain unreferenced.
+- **Replay and uncertainty.** Once the request reaches the creation-ID check, an existing album with that ID returns `409 creation_conflict` with `details.album_id`, even if the replay's files or fields differ. It is not an update or an acknowledgement of the replay body. After a lost or uncertain reply, read `GET /api/albums/<creation_id>`; a missing album is not proof that the first request has finished. If retrying, explicitly resend with the same ID. Concurrent submissions with that ID cannot create two albums while it exists. There is no replay record once the album is permanently deleted.
 
 ### Covers, extra files, lyrics and tracks
 

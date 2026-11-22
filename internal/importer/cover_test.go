@@ -84,10 +84,17 @@ func TestCoverEmbedded(t *testing.T) {
 	writeFile(t, dir+"/in.flac", track{}.flac(t))
 	writeFile(t, dir+"/c.jpg", z)
 	ffmpeg(t, "-i", dir+"/in.flac", "-i", dir+"/c.jpg", "-map", "0", "-map", "1", "-c", "copy", "-disposition:v", "attached_pic", dir+"/out.flac")
-	e.put("Muxed/1.flac", readFile(t, dir+"/out.flac"))
+	source := readFile(t, dir+"/out.flac")
+	e.put("Muxed/1.flac", source)
 	b = e.importDir("Muxed")
-	if a := e.done(b, "Muxed"); a.Cover == nil || *a.Cover != sha(z) {
+	a := e.done(b, "Muxed")
+	if a.Cover == nil || *a.Cover != sha(z) {
 		t.Errorf("ffmpeg-muxed cover %v, want %s", a.Cover, sha(z)[:8])
+	}
+	// The extracted cover is a new blob, not a new fingerprint entry.
+	wantFP, err := fingerprint([]fingerprintEntry{{Path: "1.flac", Size: int64(len(source)), Hash: sha(source)}})
+	if err != nil || a.Fingerprint != wantFP {
+		t.Errorf("fingerprint %s, want %s (%v)", a.Fingerprint, wantFP, err)
 	}
 }
 

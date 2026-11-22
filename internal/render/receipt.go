@@ -13,19 +13,37 @@ import (
 	"github.com/google/uuid"
 
 	"musiclib/internal/blobstore"
+	"musiclib/internal/catalog"
 )
 
-// ReceiptSchemaVersion is the only schema_version of the receipt (§9.2).
-const ReceiptSchemaVersion = 1
+// ReceiptSchemaVersion is the version written by new builds.
+const ReceiptSchemaVersion = 2
 
-// MaxReceiptBytes bounds what ParseReceipt accepts, and what a reader of a
-// receipt on disk (the publisher, doctor) reads: 10,000 files (§7.2) plus
-// the tracks' LRC files and the cover, at about 1.2 KB each at most.
-const MaxReceiptBytes = 16 << 20
+const (
+	legacyReceiptVersion  = 1
+	maxLegacyReceiptBytes = 16 << 20
+	storeField            = `,"store_id":`
+	trackField            = `,"track_id":`
+	sourceField           = `,"source_blob_sha256":`
+	storeFieldBytes       = len(storeField) + 2 + 36
+	trackFieldsBytes      = len(trackField) + 2 + 36 + len(sourceField) + 2 + 64
+
+	// MaxReceiptBytes is the absolute read bound for either version. V2
+	// adds only canonical store/track metadata to the legacy byte budget;
+	// attachments have no aggregate count bound. Freeze the on-disk track
+	// allowance so a future catalog limit change cannot invalidate receipts.
+	maxReceiptTracks = 1000
+	MaxReceiptBytes  = maxLegacyReceiptBytes + storeFieldBytes + maxReceiptTracks*trackFieldsBytes
+)
+
+// Every track in a valid catalog album must fit the on-disk allowance.
+var _ [maxReceiptTracks - catalog.MaxTracks]struct{}
 
 // Receipt is the content of .musiclib.json (§9.2), exactly: no names, no
 // titles, no timestamps, and not itself among its files.
 type Receipt struct {
+	SchemaVersion int
+	StoreID       uuid.UUID // Nil only for schema 1, which has no store field.
 	AlbumID       uuid.UUID
 	BuildID       uuid.UUID
 	AlbumRevision int64
@@ -37,9 +55,11 @@ type Receipt struct {
 
 // ReceiptFile is one file of the album directory, relative to it.
 type ReceiptFile struct {
-	RelativePath string
-	Size         int64
-	SHA256       string
+	RelativePath     string
+	Size             int64
+	SHA256           string
+	TrackID          uuid.UUID // Nil for files that are not catalog track outputs.
+	SourceBlobSHA256 string
 }
 
 // Encode serializes the receipt in its one canonical form, which is the
@@ -59,19 +79,31 @@ type ReceiptFile struct {
 //     Nothing else is escaped: not "<", ">", "&", U+2028 or U+2029 (unlike
 //     encoding/json, whose choices this format does not depend on).
 //
+// Schema 2 inserts store_id after schema_version and adds the optional
+// track_id and source_blob_sha256 pair after a file's sha256.
+//
 // It refuses a receipt that ParseReceipt would refuse: the two are exact
 // inverses.
 func (r Receipt) Encode() ([]byte, error) {
-	if err := r.validate(); err != nil {
+	extra, err := r.validate()
+	if err != nil {
 		return nil, err
 	}
-	return r.encode(), nil
+	data := r.encode()
+	if err := checkReceiptSize(len(data), extra); err != nil {
+		return nil, err
+	}
+	return data, nil
 }
 
 func (r Receipt) encode() []byte {
 	var b bytes.Buffer
 	b.WriteString(`{"schema_version":`)
-	b.WriteString(strconv.Itoa(ReceiptSchemaVersion))
+	b.WriteString(strconv.Itoa(r.SchemaVersion))
+	if r.SchemaVersion == ReceiptSchemaVersion {
+		b.WriteString(storeField)
+		writeString(&b, r.StoreID.String())
+	}
 	b.WriteString(`,"album_id":`)
 	writeString(&b, r.AlbumID.String())
 	b.WriteString(`,"build_id":`)
@@ -91,6 +123,12 @@ func (r Receipt) encode() []byte {
 		b.WriteString(strconv.FormatInt(f.Size, 10))
 		b.WriteString(`,"sha256":`)
 		writeString(&b, f.SHA256)
+		if f.TrackID != uuid.Nil {
+			b.WriteString(trackField)
+			writeString(&b, f.TrackID.String())
+			b.WriteString(sourceField)
+			writeString(&b, f.SourceBlobSHA256)
+		}
 		b.WriteByte('}')
 	}
 	b.WriteString("]}")
@@ -128,7 +166,8 @@ func ReceiptHash(encoded []byte) string {
 // receiptJSON is the shape ParseReceipt decodes before checking that the
 // input is exactly the canonical encoding of the result.
 type receiptJSON struct {
-	SchemaVersion *int64            `json:"schema_version"`
+	SchemaVersion *int              `json:"schema_version"`
+	StoreID       *string           `json:"store_id"`
 	AlbumID       *string           `json:"album_id"`
 	BuildID       *string           `json:"build_id"`
 	AlbumRevision *int64            `json:"album_revision"`
@@ -137,19 +176,19 @@ type receiptJSON struct {
 }
 
 type receiptFileJSON struct {
-	RelativePath *string `json:"relative_path"`
-	Size         *int64  `json:"size"`
-	SHA256       *string `json:"sha256"`
+	RelativePath     *string `json:"relative_path"`
+	Size             *int64  `json:"size"`
+	SHA256           *string `json:"sha256"`
+	TrackID          *string `json:"track_id"`
+	SourceBlobSHA256 *string `json:"source_blob_sha256"`
 }
 
 // ParseReceipt reads a receipt strictly: the publisher's recovery (§9.4) and
 // doctor (§11.3) trust nothing else. It accepts exactly the bytes Encode
 // produces, so it refuses unknown, missing or repeated fields, another key
 // order, whitespace, another escaping or number form, and a trailing
-// newline; and it checks the content: schema_version 1, two non-nil UUIDs,
-// a positive revision, a render_version, and files with valid relative
-// paths (not the receipt itself), sizes and SHA-256, sorted by path bytes
-// with no path twice. Any refusal is CodeReceiptInvalid.
+// newline. It validates schema 1 or 2, including version-specific identity
+// and provenance, and the common file inventory. Any refusal is CodeReceiptInvalid.
 func ParseReceipt(data []byte) (Receipt, error) {
 	fail := func(format string, args ...any) (Receipt, error) {
 		return Receipt{}, errorf(CodeReceiptInvalid, "the receipt is not valid: "+format, args...)
@@ -174,23 +213,47 @@ func ParseReceipt(data []byte) (Receipt, error) {
 		j.RenderVersion == nil || j.Files == nil {
 		return fail("a field is missing")
 	}
-	if *j.SchemaVersion != ReceiptSchemaVersion {
-		return fail("schema_version %d, only %d is known", *j.SchemaVersion, ReceiptSchemaVersion)
+	switch *j.SchemaVersion {
+	case legacyReceiptVersion, ReceiptSchemaVersion:
+	default:
+		return fail("unknown schema_version %d", *j.SchemaVersion)
 	}
 	albumID, err1 := uuid.Parse(*j.AlbumID)
 	buildID, err2 := uuid.Parse(*j.BuildID)
 	if err1 != nil || err2 != nil {
 		return fail("album_id or build_id is not a UUID")
 	}
-	r := Receipt{AlbumID: albumID, BuildID: buildID, AlbumRevision: *j.AlbumRevision, RenderVersion: *j.RenderVersion,
-		Files: make([]ReceiptFile, len(j.Files))}
+	r := Receipt{SchemaVersion: *j.SchemaVersion, AlbumID: albumID, BuildID: buildID,
+		AlbumRevision: *j.AlbumRevision, RenderVersion: *j.RenderVersion, Files: make([]ReceiptFile, len(j.Files))}
+	if j.StoreID != nil {
+		id, err := uuid.Parse(*j.StoreID)
+		if err != nil || id == uuid.Nil {
+			return fail("store_id is not a non-nil UUID")
+		}
+		r.StoreID = id
+	}
 	for i, f := range j.Files {
 		if f.RelativePath == nil || f.Size == nil || f.SHA256 == nil {
 			return fail("file %d misses a field", i)
 		}
-		r.Files[i] = ReceiptFile{RelativePath: *f.RelativePath, Size: *f.Size, SHA256: *f.SHA256}
+		file := ReceiptFile{RelativePath: *f.RelativePath, Size: *f.Size, SHA256: *f.SHA256}
+		if (f.TrackID == nil) != (f.SourceBlobSHA256 == nil) {
+			return fail("file %d has incomplete track provenance", i)
+		}
+		if f.TrackID != nil {
+			id, err := uuid.Parse(*f.TrackID)
+			if err != nil || id == uuid.Nil {
+				return fail("file %d: track_id is not a non-nil UUID", i)
+			}
+			file.TrackID, file.SourceBlobSHA256 = id, *f.SourceBlobSHA256
+		}
+		r.Files[i] = file
 	}
-	if err := r.validate(); err != nil {
+	extra, err := r.validate()
+	if err != nil {
+		return Receipt{}, err
+	}
+	if err := checkReceiptSize(len(data), extra); err != nil {
 		return Receipt{}, err
 	}
 	if !bytes.Equal(r.encode(), data) {
@@ -199,10 +262,25 @@ func ParseReceipt(data []byte) (Receipt, error) {
 	return r, nil
 }
 
-// validate checks the content rules shared by Encode and ParseReceipt.
-func (r Receipt) validate() error {
-	fail := func(format string, args ...any) error {
-		return errorf(CodeReceiptInvalid, "the receipt is not valid: "+format, args...)
+// validate checks shared content rules and returns the exact extra bytes of
+// canonical v2 provenance. Neither version can spend that on common fields.
+func (r Receipt) validate() (int, error) {
+	fail := func(format string, args ...any) (int, error) {
+		return 0, errorf(CodeReceiptInvalid, "the receipt is not valid: "+format, args...)
+	}
+	extra := 0
+	switch r.SchemaVersion {
+	case legacyReceiptVersion:
+		if r.StoreID != uuid.Nil {
+			return fail("schema 1 cannot carry a store_id")
+		}
+	case ReceiptSchemaVersion:
+		if r.StoreID == uuid.Nil {
+			return fail("schema 2 requires a non-nil store_id")
+		}
+		extra = storeFieldBytes
+	default:
+		return fail("unknown schema_version %d", r.SchemaVersion)
 	}
 	switch {
 	case r.AlbumID == uuid.Nil || r.BuildID == uuid.Nil:
@@ -212,7 +290,21 @@ func (r Receipt) validate() error {
 	case r.RenderVersion == "" || !utf8.ValidString(r.RenderVersion):
 		return fail("an empty or invalid render_version")
 	}
+	seen := make(map[uuid.UUID]struct{})
 	for i, f := range r.Files {
+		if f.TrackID != uuid.Nil || f.SourceBlobSHA256 != "" {
+			if r.SchemaVersion != ReceiptSchemaVersion || f.TrackID == uuid.Nil || blobstore.ValidateSHA(f.SourceBlobSHA256) != nil {
+				return fail("file %d has invalid track provenance", i)
+			}
+			if _, ok := seen[f.TrackID]; ok {
+				return fail("duplicate track_id %s", f.TrackID)
+			}
+			if len(seen) == maxReceiptTracks {
+				return fail("more than %d track IDs", maxReceiptTracks)
+			}
+			seen[f.TrackID] = struct{}{}
+			extra += trackFieldsBytes
+		}
 		if err := checkOutputPath(f.RelativePath); err != nil {
 			return fail("file %d: %v", i, err)
 		}
@@ -232,7 +324,20 @@ func (r Receipt) validate() error {
 			return fail("files not sorted by path bytes, or a path twice: %q then %q", r.Files[i-1].RelativePath, f.RelativePath)
 		}
 	}
+	return extra, nil
+}
+
+func checkReceiptSize(size, extra int) error {
+	if size > maxLegacyReceiptBytes+extra {
+		return errorf(CodeReceiptInvalid, "the receipt is not valid: %d bytes, the maximum for its inventory is %d", size, maxLegacyReceiptBytes+extra)
+	}
 	return nil
+}
+
+// ForeignStore reports whether this valid receipt names a different store.
+// V1 has no store identity; callers must still check their catalog anchors.
+func (r Receipt) ForeignStore(expected uuid.UUID) bool {
+	return r.SchemaVersion == ReceiptSchemaVersion && r.StoreID != expected
 }
 
 // String names the receipt for logs.

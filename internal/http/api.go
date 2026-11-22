@@ -84,6 +84,8 @@ type Backend struct {
 	// Tracks reads an uploaded track with the checks of an import: the
 	// importer.
 	Tracks TrackReader
+	// Creation prepares a complete pinned album before the catalog transaction.
+	Creation AlbumPreparer
 }
 
 // TrackReader reads a pinned blob as one track, with exactly the checks of
@@ -168,10 +170,12 @@ func (a *API) ServeHTTP(w nethttp.ResponseWriter, r *nethttp.Request) {
 	setSecurityHeaders(w.Header())
 	w.Header().Set("Cache-Control", "no-store")
 	if e := a.checkBoundary(r, false); e != nil {
+		closeCreationOnRefusal(w, r)
 		a.writeError(w, e)
 		return
 	}
 	if !a.signedIn(r) {
+		closeCreationOnRefusal(w, r)
 		a.writeError(w, newError(nethttp.StatusUnauthorized, CodeLoginRequired,
 			"sign in first: open /login in the browser, or POST the password to /login"))
 		return
@@ -184,6 +188,7 @@ func (a *API) ServeHTTP(w nethttp.ResponseWriter, r *nethttp.Request) {
 	}
 	st := a.state.Load()
 	if st.router == nil {
+		closeCreationOnRefusal(w, r)
 		a.writeError(w, newError(nethttp.StatusServiceUnavailable, st.code, "%s", st.message))
 		return
 	}
@@ -261,7 +266,7 @@ func notFound() *Error {
 // also has a pattern without a method, so that a wrong method is a JSON
 // 405 with Allow, and /api/ catches the rest as a JSON 404.
 func (a *API) routes(b Backend) nethttp.Handler {
-	h := &handlers{api: a, catalog: b.Catalog, blobs: b.Blobs, budget: b.Budget, work: b.Work, source: b.Source, tracks: b.Tracks}
+	h := &handlers{api: a, catalog: b.Catalog, blobs: b.Blobs, budget: b.Budget, work: b.Work, source: b.Source, tracks: b.Tracks, creation: b.Creation}
 	mux := nethttp.NewServeMux()
 	route := func(pattern string, methods map[string]nethttp.HandlerFunc) {
 		var allow []string
@@ -342,7 +347,8 @@ func (a *API) routes(b Backend) nethttp.Handler {
 	})
 	// Round 16: the library list, the imports and the queue (§10.2).
 	route("/api/albums", map[string]nethttp.HandlerFunc{
-		nethttp.MethodGet: h.listAlbums,
+		nethttp.MethodGet:  h.listAlbums,
+		nethttp.MethodPost: h.postAlbum,
 	})
 	route("/api/import-source", map[string]nethttp.HandlerFunc{
 		nethttp.MethodGet: h.importSource,
@@ -379,11 +385,12 @@ func (a *API) routes(b Backend) nethttp.Handler {
 
 // handlers are the endpoints over one backend.
 type handlers struct {
-	api     *API
-	catalog *catalog.Service
-	blobs   *blobstore.Store
-	budget  *jobs.Budget
-	work    *fsops.Root
-	source  *fsops.Root
-	tracks  TrackReader
+	api      *API
+	catalog  *catalog.Service
+	blobs    *blobstore.Store
+	budget   *jobs.Budget
+	work     *fsops.Root
+	source   *fsops.Root
+	tracks   TrackReader
+	creation AlbumPreparer
 }

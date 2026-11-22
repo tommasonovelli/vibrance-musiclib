@@ -13,6 +13,7 @@ import (
 
 	"musiclib/internal/blobstore"
 	"musiclib/internal/catalog"
+	"musiclib/internal/jobs"
 	"musiclib/internal/media"
 )
 
@@ -136,34 +137,60 @@ func bodyError(err error, limit int64) *Error {
 // MaxBytesReader) is 413, ENOSPC 507; the temporary is removed on every
 // failure by the put itself.
 func (h *handlers) pin(ctx context.Context, src io.Reader, estimate, limit int64) (catalog.Blob, *Error, error) {
+	res, err := h.reserveUpload(estimate)
+	if err == nil {
+		defer res.Release()
+		var b blobstore.Blob
+		b, err = h.putUpload(ctx, src, limit)
+		if err == nil {
+			return catalog.Blob{Hash: b.SHA256, Size: b.Size}, nil, nil
+		}
+	}
+	var e *Error
+	if errors.As(err, &e) {
+		return catalog.Blob{}, e, nil
+	}
+	return catalog.Blob{}, nil, err
+}
+
+func (h *handlers) reserveUpload(estimate int64) (*jobs.Reservation, error) {
 	fs, err := h.work.StatFS()
 	if err != nil {
-		return catalog.Blob{}, nil, err
+		return nil, err
 	}
 	res, avail := h.budget.Reserve(fs.FreeBytes, estimate)
 	if res == nil {
-		return catalog.Blob{}, newError(nethttp.StatusInsufficientStorage, CodeInsufficientSpace,
+		return nil, newError(nethttp.StatusInsufficientStorage, CodeInsufficientSpace,
 			"the upload needs up to %d bytes; the server can use %d now", estimate, max(0, avail)).
-			with("needed", estimate), nil
+			with("needed", estimate)
 	}
-	defer res.Release()
+	return res, nil
+}
+
+// putUpload puts one stream under a reservation owned by the caller.
+func (h *handlers) putUpload(ctx context.Context, src io.Reader, limit int64) (blobstore.Blob, error) {
 	b, err := h.blobs.Put(ctx, src)
-	if err != nil {
-		var mbe *nethttp.MaxBytesError
-		switch {
-		case errors.As(err, &mbe):
-			return catalog.Blob{}, tooLarge(limit), nil
-		case blobstore.Code(err) == blobstore.CodeNoSpace:
-			return catalog.Blob{}, newError(nethttp.StatusInsufficientStorage, CodeInsufficientSpace,
-				"the disk is full: the upload was not saved"), nil
-		case blobstore.Code(err) == blobstore.CodeSource, ctx.Err() != nil:
-			// The client stopped sending, or went away: nothing to log as
-			// the server's failure.
-			return catalog.Blob{}, newError(nethttp.StatusBadRequest, CodeUploadIncomplete, "the file could not be read to its end"), nil
-		}
-		return catalog.Blob{}, nil, err
+	var mbe *nethttp.MaxBytesError
+	var e *Error
+	switch {
+	case err == nil:
+		return b, nil
+	case errors.As(err, &e):
+		return blobstore.Blob{}, e
+	case errors.As(err, &mbe):
+		return blobstore.Blob{}, tooLarge(limit)
+	case blobstore.Code(err) == blobstore.CodeNoSpace:
+		return blobstore.Blob{}, newError(nethttp.StatusInsufficientStorage, CodeInsufficientSpace,
+			"the disk is full: the upload was not saved")
+	case blobstore.Code(err) == blobstore.CodeSource, ctx.Err() != nil:
+		return blobstore.Blob{}, incompleteUpload()
+	default:
+		return blobstore.Blob{}, err
 	}
-	return catalog.Blob{Hash: b.SHA256, Size: b.Size}, nil, nil
+}
+
+func incompleteUpload() *Error {
+	return newError(nethttp.StatusBadRequest, CodeUploadIncomplete, "the file could not be read to its end")
 }
 
 // MaxConcurrentUploads is how many uploads copy their body at once (§6.1:

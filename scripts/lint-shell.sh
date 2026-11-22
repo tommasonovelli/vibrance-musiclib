@@ -12,7 +12,7 @@ readonly SHELLCHECK_IMAGE='koalaman/shellcheck:v0.11.0@sha256:61862eba1fcf09a484
 
 cd -- "${REPO_ROOT}"
 mapfile -t files < <(find scripts docker -type f -name '*.sh' | LC_ALL=C sort)
-[[ ${#files[@]} -gt 0 ]] || die "no shell scripts found"
+files=(musiclib "${files[@]}")
 
 info "shellcheck ${#files[@]} files"
 docker run --rm --network none --read-only --user "${MUSICLIB_DEV_UID}:${MUSICLIB_DEV_GID}" \

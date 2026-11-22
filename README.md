@@ -4,7 +4,7 @@
 
 MusicLib keeps your music collection tidy without ever touching your original files.
 
-1. **Import** your album folders. MusicLib copies each file into its own store and never changes, moves or deletes the source.
+1. **Import** your album folders or **create an album** from individual audio files in the browser. MusicLib keeps its own immutable copies and never changes the source files.
 2. **Fix the metadata in your browser**: artists, album titles, years, genres, track titles and numbers, covers, lyrics and extra files such as booklets.
 3. **MusicLib writes a clean library folder**: one folder per artist and per album, consistently named files, complete tags and the cover in every track. Any program that reads music folders can use it.
 
@@ -50,17 +50,14 @@ More: [What you need](docs/operations.md#what-you-need).
 
 By default MusicLib keeps its data (the originals and the generated library) in Docker's own storage, readable only with `sudo`. To keep it in a folder of your choice instead, such as `/srv/musiclib/data`, **decide now**: MusicLib pairs its database with its data folder at the first start.
 
-To do it, follow [The data in a host folder](docs/operations.md#the-data-in-a-host-folder). It takes the place of step 3 (it runs the same block, creates the folder and starts MusicLib); then go on with step 4. Otherwise, skip this step.
+To do it, follow [The data in a host folder](docs/operations.md#the-data-in-a-host-folder). It takes the place of step 3 (it prepares the release files, creates the folder and starts MusicLib); then go on with step 4. Otherwise, skip this step.
 
 ### 3. Install and start
 
-Paste this block into a terminal. It creates `~/vibrance`, downloads the two files of the latest release, writes a random database password and a random sign-in password into `.env`, and starts MusicLib:
+[Prepare the release files](docs/operations.md#prepare-the-release-files-do-not-start-yet). The published 1.2.0 release does not include the `musiclib` command; the preparation block works for 1.2.0 and for releases that include it. Once preparation succeeds, start your new installation. **If restoring a backup, do not start it yet**; follow the [restore procedure](docs/operations.md#restore-use-new-empty-destinations) instead.
 
 ```sh
-mkdir -p ~/vibrance/import && cd ~/vibrance
-[ -e compose.yaml ] || curl -fsSLO https://github.com/tommasonovelli/vibrance-musiclib/releases/latest/download/compose.yaml
-[ -e .env ] || { curl -fsSL -o .env https://github.com/tommasonovelli/vibrance-musiclib/releases/latest/download/env.example && chmod 600 .env && sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$(openssl rand -hex 32)/" .env && sed -i "s|^MUSICLIB_PASSWORD=.*|MUSICLIB_PASSWORD=$(openssl rand -base64 24)|" .env; }
-docker compose up -d --wait
+cd ~/vibrance && docker compose up -d --wait
 ```
 
 The first time, Docker downloads the images; the last command returns when MusicLib is ready. Check it:
@@ -71,8 +68,7 @@ curl -f http://127.0.0.1:8080/health/ready           # prints {"status":"ready"}
 ```
 
 - **Run every command of this README from `~/vibrance`** (`cd ~/vibrance`).
-- The block is safe to paste twice: it never replaces an existing `compose.yaml` or `.env`. What each line does: [First start](docs/operations.md#first-start).
-- `.env` holds both passwords: keep it private (the block makes it readable by you only).
+- `.env` holds both passwords: keep it private (the preparation block makes it readable by you only).
 - If the app is reported unhealthy, `docker compose logs --tail=20 app` shows a line with a `code`: look it up in [Troubleshooting](docs/operations.md#troubleshooting).
 
 ### 4. Sign in
@@ -143,6 +139,8 @@ Every setting, with its default: [Configuration](docs/operations.md#configuratio
 
 Audio must be **FLAC**, **MP3** or **M4A** (AAC or ALAC). Leave the files unchanged until the import has finished. How folders become albums, and what to do when one needs attention: [Importing and the Activity page](docs/operations.md#importing-and-the-activity-page).
 
+On releases with **Create album** in the sidebar, you can instead assemble one album from individual audio files. The draft stays in the tab until you confirm. MusicLib verifies the files, saves the album all at once, then publishes it separately; check **Activity** before looking for the library files. See [Creating an album in the browser](docs/operations.md#creating-an-album-in-the-browser).
+
 ### 7. Find your library
 
 MusicLib writes the library folder, `Artist/Album/NN - Title.ext` with the cover and complete tags:
@@ -170,30 +168,13 @@ MusicLib starts again by itself after a reboot, unless you stopped it.
 
 ### Back up
 
-MusicLib must be stopped while a backup runs; PostgreSQL keeps running:
-
-```sh
-docker compose stop app
-docker compose run --rm --no-deps app backup --to "/backup/$(date +%F-%H%M)"
-docker compose start app
-```
-
-A good result is `Backup completed: /backup/2026-09-29-2130`: a new folder, named after the date and time, in the backup folder (step 5). A backup never overwrites another. Restoring, and moving to another machine: [Backups, restore and moving](docs/operations.md#backups-restore-and-moving).
+If your release includes `musiclib`, run `./musiclib backup` (or `./musiclib backup before-upgrade`). It stops the app during the backup and restarts it after success if it was running. PostgreSQL stays up. The default name is a UTC timestamp; a backup never overwrites another. For 1.2.0 and older installations without the command, use the [manual backup procedure](docs/operations.md#manual-backup-and-restore). For restores and backup storage on a separate disk, see [Backups, restore and moving](docs/operations.md#backups-restore-and-moving).
 
 ### Update to a new version
 
-```sh
-cd ~/vibrance
-docker compose stop app &&
-docker compose run --rm --no-deps app backup --to "/backup/before-update-$(date +%F-%H%M)" &&
-curl -fsSLO https://github.com/tommasonovelli/vibrance-musiclib/releases/latest/download/compose.yaml &&
-docker compose pull && docker compose up -d --wait
-docker compose run --rm --no-deps app version
-```
+[Back up first, then follow the published-image upgrade procedure](docs/operations.md#upgrading-the-published-image). Download `compose.yaml` and (when available) `musiclib` from the same explicit release tag. Your settings stay in `.env`. `docker compose pull` alone does not change the version. The upgrade from 1.2.0 to receipt schema 2 needs time and space for [whole-album rerenders](docs/operations.md#from-120-to-receipt-schema-2). To go back, [restore the pre-upgrade backup into a fresh environment](docs/operations.md#rolling-back-an-upgrade) with the older release.
 
-The block backs up first, and updates nothing if the backup fails. `compose.yaml` names the version to run, so the update downloads the latest release's `compose.yaml`: `docker compose pull` alone keeps the version you have. Your settings stay in `.env`. The last line prints the new version. Going back to an older version is possible only by restoring the backup: see [Upgrading](docs/operations.md#upgrading).
-
-**Upgrading from 1.0.0?** 1.1.0 does not start without a sign-in password, and the `.env` of 1.0.0 has none. Add one **before** the update block:
+**Upgrading from 1.0.0?** 1.1.0 does not start without a sign-in password, and the `.env` of 1.0.0 has none. Add one **before** upgrading:
 
 ```sh
 cd ~/vibrance
@@ -211,7 +192,7 @@ By default only the machine MusicLib runs on can open it; from other devices use
 
 **It does:**
 
-- import album folders, including multi-disc albums, and report what it imported and what it skipped, and why; add tracks to an album from the browser, checked like an import, or move tracks to another album;
+- import album folders, including multi-disc albums, and report what it imported and what it skipped, and why; create albums and add tracks from the browser, or move tracks to another album;
 - read and write tags of **FLAC**, **MP3** and **M4A** (AAC or ALAC) files;
 - manage **JPEG and PNG covers**, **LRC lyrics** and **extra files** (booklets, scans, logs);
 - let you search the library, move albums to the trash, restore them or empty the trash (the originals stay);

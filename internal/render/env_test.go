@@ -119,6 +119,7 @@ type album struct {
 func (e *env) album(artist, title string) *album {
 	return &album{e: e, s: &jobs.RenderSnapshot{
 		Attempt:       jobs.Attempt{JobID: uuid.New(), Ticket: 1},
+		StoreID:       uuid.New(),
 		RenderVersion: Version,
 		Artist:        jobs.SnapshotArtist{ID: uuid.New(), Name: artist, Revision: 1},
 		Album:         jobs.SnapshotAlbum{ID: uuid.New(), Title: title, Year: 1959, Genre: textOf("Jazz"), Revision: 2},

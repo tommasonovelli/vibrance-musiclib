@@ -51,7 +51,7 @@ func doctorFixture(t *testing.T) (*volume.Volume, *pgxpool.Pool, string, func(bo
 	path := "Artist/Album"
 	content := []byte("rendered")
 	sum := sha256.Sum256(content)
-	rec := render.Receipt{AlbumID: album, BuildID: build, AlbumRevision: 1, RenderVersion: render.Version, Files: []render.ReceiptFile{{RelativePath: "01 - Track.flac", Size: int64(len(content)), SHA256: hex.EncodeToString(sum[:])}}}
+	rec := render.Receipt{SchemaVersion: 1, AlbumID: album, BuildID: build, AlbumRevision: 1, RenderVersion: render.Version, Files: []render.ReceiptFile{{RelativePath: "01 - Track.flac", Size: int64(len(content)), SHA256: hex.EncodeToString(sum[:])}}}
 	encoded, err := rec.Encode()
 	if err != nil {
 		t.Fatal(err)
@@ -164,6 +164,59 @@ func TestDoctorFindings(t *testing.T) {
 				t.Fatalf("missing %s: %+v", tc.code, r)
 			}
 		})
+	}
+}
+
+func TestDoctorReceiptStoreAndPublishedHash(t *testing.T) {
+	v, db, dir, check := doctorFixture(t)
+	if r := check(true); r.HasErrors() {
+		t.Fatalf("DB-anchored v1: %+v", r)
+	}
+	const album = "/library/Artist/Album/"
+	path := dir + album + render.ReceiptName
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := render.ParseReceipt(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := &r.Files[0]
+	if err := db.QueryRow(t.Context(), `SELECT id, blob_hash FROM tracks`).Scan(&f.TrackID, &f.SourceBlobSHA256); err != nil {
+		t.Fatal(err)
+	}
+	r.SchemaVersion, r.StoreID = render.ReceiptSchemaVersion, v.StoreID()
+	write := func() {
+		t.Helper()
+		data, err := r.Encode()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(t.Context(), `UPDATE albums SET published_receipt_hash=$1`, render.ReceiptHash(data)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write()
+	if r := check(true); r.HasErrors() {
+		t.Fatalf("DB-anchored v2 (different source and output hashes): %+v", r)
+	}
+	if err := os.WriteFile(dir+album+f.RelativePath, []byte("altered!"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if r := check(false); r.HasErrors() {
+		t.Fatalf("shallow check of same-size damage: %+v", r)
+	}
+	if r := check(true); !hasFinding(r, "doctor_output_hash") {
+		t.Fatalf("missing actual output hash error: %+v", r)
+	}
+	r.StoreID = uuid.New()
+	write()
+	if r := check(true); !hasFinding(r, "doctor_foreign_output") || hasFinding(r, "doctor_output_hash") {
+		t.Fatalf("doctor treated a foreign receipt as DB-owned: %+v", r)
 	}
 }
 

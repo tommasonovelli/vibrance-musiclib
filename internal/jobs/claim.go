@@ -42,6 +42,7 @@ type Claim struct {
 // returns it. It carries no absolute path (§13.2).
 type RenderSnapshot struct {
 	Attempt Attempt
+	StoreID uuid.UUID
 	// RenderVersion is the renderer the claim was made for. PREPARE's
 	// recheck compares it with the current one (§6.3).
 	RenderVersion string
@@ -239,8 +240,15 @@ func loadSnapshot(ctx context.Context, q *store.Queries, albumID uuid.UUID, a At
 	if err != nil {
 		return nil, dbErr("loading the attachments of album "+albumID.String(), err)
 	}
+	storeID, err := q.GetStoreID(ctx)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return nil, dbErr("loading the store identity", err)
+	}
+	// An unpaired catalog has no store identity and cannot build output.
+	// The daemon pairs the catalog and volume before starting any workers.
 	s := &RenderSnapshot{
 		Attempt:       a,
+		StoreID:       storeID,
 		RenderVersion: renderVersion,
 		Artist:        SnapshotArtist{ID: al.ArtistID, Name: al.ArtistName, Revision: al.ArtistRevision},
 		Album: SnapshotAlbum{

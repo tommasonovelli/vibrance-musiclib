@@ -1,10 +1,17 @@
 package http
 
 import (
+	"bufio"
 	"bytes"
+	"encoding/json"
+	"fmt"
+	"net"
 	nethttp "net/http"
+	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"musiclib/internal/catalog"
 	"musiclib/internal/jobs"
@@ -114,6 +121,76 @@ func TestSecurityBoundary(t *testing.T) {
 	}
 }
 
+func TestAlbumCreationHTTP1RefusesPausedBody(t *testing.T) {
+	e := newEnv(t)
+	e.enableCreation(forbidPreparation(t))
+	s := httptest.NewServer(e.api)
+	defer s.Close()
+
+	for _, tc := range []struct {
+		name, code string
+		status     int
+		change     func(nethttp.Header)
+	}{
+		{"wrong host", CodeHostNotAllowed, 421, func(h nethttp.Header) { h.Set("Host", "wrong.invalid") }},
+		{"wrong origin", CodeOriginNotAllowed, 403, func(h nethttp.Header) { h.Set("Origin", "https://wrong.invalid") }},
+		{"missing request header", CodeRequestHeaderRequired, 403, func(h nethttp.Header) { h.Del(RequestHeader) }},
+		{"unauthenticated fixed length", CodeLoginRequired, 401, func(h nethttp.Header) {
+			h.Del("Cookie")
+			h.Del("Transfer-Encoding")
+			h.Set("Content-Length", "256")
+		}},
+		{"unsupported type", CodeUnsupportedMediaType, 415, func(h nethttp.Header) { h.Set("Content-Type", "application/json") }},
+		{"invalid boundary", CodeInvalidMultipart, 422, func(h nethttp.Header) { h.Set("Content-Type", "multipart/form-data") }},
+		{"declared too large", CodeBodyTooLarge, 413, func(h nethttp.Header) {
+			h.Del("Transfer-Encoding")
+			h.Set("Content-Length", strconv.FormatInt(maxCreationBytes+1, 10))
+		}},
+		{"creation unavailable", CodeNotReady, 503, func(nethttp.Header) { e.api.Enable(e.backend()) }},
+		{"API disabled", CodeShuttingDown, 503, func(nethttp.Header) { e.api.Disable(CodeShuttingDown, "shutting down") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conn, err := net.DialTimeout("tcp", s.Listener.Addr().String(), 3*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			if err := conn.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			h := nethttp.Header{
+				"Host": {testHost}, "Origin": {testOrigin}, RequestHeader: {"1"},
+				"Cookie": {sessionCookie + "=" + e.session}, "Transfer-Encoding": {"chunked"},
+				"Content-Type": {"multipart/form-data; boundary=test"},
+			}
+			tc.change(h)
+			// Send only headers, without Expect: 100-continue or a client
+			// Connection: close. The body stays paused until the refusal.
+			var wire bytes.Buffer
+			fmt.Fprint(&wire, "POST /api/albums HTTP/1.1\r\n")
+			if err := h.Write(&wire); err != nil {
+				t.Fatal(err)
+			}
+			wire.WriteString("\r\n")
+			if _, err := wire.WriteTo(conn); err != nil {
+				t.Fatal(err)
+			}
+			r, err := nethttp.ReadResponse(bufio.NewReader(conn), nil)
+			if err != nil {
+				t.Fatalf("refusal did not arrive with the request body still paused: %v", err)
+			}
+			defer r.Body.Close()
+			var refusal Error
+			if err := json.NewDecoder(r.Body).Decode(&refusal); err != nil {
+				t.Fatal(err)
+			}
+			if r.StatusCode != tc.status || refusal.Code != tc.code || !r.Close {
+				t.Fatalf("got %d %s (close=%v), want %d %s and close", r.StatusCode, refusal.Code, r.Close, tc.status, tc.code)
+			}
+		})
+	}
+}
+
 // Routing: JSON 404 and 405 with Allow; no redirect for an unclean path.
 func TestRouting(t *testing.T) {
 	e := newEnv(t)
@@ -127,7 +204,7 @@ func TestRouting(t *testing.T) {
 		{"GET", "/api/", notFound404, CodeNotFound, ""},
 		{"GET", "/api", notFound404, CodeNotFound, ""},
 		{"GET", "/api/imports/", notFound404, CodeNotFound, ""},
-		{"PUT", "/api/albums", nethttp.StatusMethodNotAllowed, CodeMethodNotAllowed, "GET, HEAD"},
+		{"PUT", "/api/albums", nethttp.StatusMethodNotAllowed, CodeMethodNotAllowed, "GET, HEAD, POST"},
 		{"GET", "/api/jobs/retry-failed", nethttp.StatusMethodNotAllowed, CodeMethodNotAllowed, "POST"},
 		{"GET", "/api/artists/", notFound404, CodeNotFound, ""},
 		{"GET", "/api//artists", notFound404, CodeNotFound, ""},

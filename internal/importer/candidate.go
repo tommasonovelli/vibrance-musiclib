@@ -18,17 +18,13 @@ import (
 	"musiclib/internal/names"
 )
 
-// importFile is one file of a candidate after its copy and its reading.
-type importFile struct {
-	src  *srcFile
+// candidateFile describes a pinned file without its source-walk identity.
+type candidateFile struct {
+	rel  string
 	blob blobstore.Blob
-	// audio, format, tags and duration are set for a track. duration is
-	// what the container declares, 0 when it declares nothing (unknown,
-	// NOTES.md N-300).
-	audio    bool
-	format   string
-	tags     media.Inspection
-	duration time.Duration
+	// audioRead is populated only for tracks.
+	audio bool
+	audioRead
 	// disc is the number of the track's disc directory in a multi-disc
 	// candidate, 0 in a single-disc one (§7.3).
 	disc int
@@ -76,13 +72,13 @@ func (im *Importer) importCandidate(ctx context.Context, c *jobs.Claim) (_ catal
 	if err := im.failpoints.Hit("import_copying"); err != nil {
 		return catalog.ImportCandidate{}, nil, err
 	}
-	files := make([]*importFile, len(srcFiles))
+	files := make([]*candidateFile, len(srcFiles))
 	for i, f := range srcFiles {
 		b, err := im.copyFile(ctx, r, f)
 		if err != nil {
 			return catalog.ImportCandidate{}, nil, err
 		}
-		files[i] = &importFile{src: f, blob: b}
+		files[i] = &candidateFile{rel: f.Rel, blob: b}
 	}
 	if err := im.failpoints.Hit("import_copied"); err != nil {
 		return catalog.ImportCandidate{}, nil, err
@@ -100,8 +96,19 @@ func (im *Importer) importCandidate(ctx context.Context, c *jobs.Claim) (_ catal
 	if err != nil {
 		return catalog.ImportCandidate{}, ws, err
 	}
-	cand, more, err := im.buildCandidate(ctx, c, tracks, others)
+	album, more, err := im.prepareAlbum(ctx, dirName(c.SourceRel), c.Overrides, tracks, others)
 	ws = append(ws, more...)
+	if err != nil {
+		return catalog.ImportCandidate{}, ws, err
+	}
+
+	// Fingerprint all source files, not just the blobs referenced by the
+	// assembled album. In particular, an extracted cover is not a source file.
+	entries := make([]fingerprintEntry, len(files))
+	for i, f := range files {
+		entries[i] = fingerprintEntry{Path: f.rel, Size: f.blob.Size, Hash: f.blob.SHA256}
+	}
+	fp, err := fingerprint(entries)
 	if err != nil {
 		return catalog.ImportCandidate{}, ws, err
 	}
@@ -113,8 +120,11 @@ func (im *Importer) importCandidate(ctx context.Context, c *jobs.Claim) (_ catal
 	if err := im.checkUnchanged(ctx, r, len(segs), c.SourceRel, before); err != nil {
 		return catalog.ImportCandidate{}, ws, err
 	}
-	cand.Warnings = ws
-	return cand, ws, nil
+	return catalog.ImportCandidate{
+		Attempt: c.Attempt, Fingerprint: fp, Warnings: ws,
+		Blobs: album.Blobs, Artist: album.Artist, Title: album.Title, Year: album.Year, Genre: album.Genre,
+		Compilation: album.Compilation, CoverHash: album.CoverHash, Tracks: album.Tracks, Attachments: album.Attachments,
+	}, ws, nil
 }
 
 // revalidate walks the candidate again and applies the scan's rules to it:
@@ -220,10 +230,10 @@ func (im *Importer) checkUnchanged(ctx context.Context, r *fsops.Root, depth int
 
 // readFile reads one verified copy of a candidate with readAudio and, for
 // a track, keeps what it read.
-func (im *Importer) readFile(ctx context.Context, f *importFile) ([]jobs.Warning, error) {
-	a, audio, ws, err := im.readAudio(ctx, f.blob.SHA256, f.src.Rel)
+func (im *Importer) readFile(ctx context.Context, f *candidateFile) ([]jobs.Warning, error) {
+	a, audio, ws, err := im.readAudio(ctx, f.blob.SHA256, f.rel)
 	if err == nil && audio {
-		f.audio, f.format, f.tags, f.duration = true, a.format, a.tags, a.duration
+		f.audio, f.audioRead = true, a
 	}
 	return ws, err
 }
@@ -371,25 +381,25 @@ func tagWarnings(rel string, in media.Inspection) ([]jobs.Warning, error) {
 // 4, N-184), whose number becomes their disc (§7.3). There is at least one
 // track, and at most MaxTracks over all discs. Tracks are sorted by
 // pathNaturalCompare, the others by path.
-func splitTracks(files []*importFile, discs map[string]int, sourceRel string) (tracks, others []*importFile, err error) {
+func splitTracks(files []*candidateFile, discs map[string]int, sourceRel string) (tracks, others []*candidateFile, err error) {
 	for _, f := range files {
 		if !f.audio {
 			others = append(others, f)
 			continue
 		}
-		dir := path.Dir(f.src.Rel)
+		dir := path.Dir(f.rel)
 		switch no, ok := discs[dir]; {
 		case discs == nil && dir == ".":
 		case ok:
 			f.disc = no
 		case discs == nil:
-			return nil, nil, &Error{Code: CodeAmbiguousCandidate, Path: f.src.Rel,
+			return nil, nil, &Error{Code: CodeAmbiguousCandidate, Path: f.rel,
 				Message: fmt.Sprintf("%s has audio files and more audio below it (%q): import its subdirectories separately",
-					label(sourceRel, ""), joinRel(sourceRel, f.src.Rel))}
+					label(sourceRel, ""), joinRel(sourceRel, f.rel))}
 		default:
-			return nil, nil, &Error{Code: CodeAmbiguousCandidate, Path: f.src.Rel,
+			return nil, nil, &Error{Code: CodeAmbiguousCandidate, Path: f.rel,
 				Message: fmt.Sprintf("%s is a multi-disc album, but %q is audio outside its disc directories: move it into one of them",
-					label(sourceRel, ""), joinRel(sourceRel, f.src.Rel))}
+					label(sourceRel, ""), joinRel(sourceRel, f.rel))}
 		}
 		tracks = append(tracks, f)
 	}
@@ -399,35 +409,35 @@ func splitTracks(files []*importFile, discs map[string]int, sourceRel string) (t
 	case len(tracks) > MaxTracks:
 		return nil, nil, errorf(catalog.CodeTooManyFiles, "%s has %d tracks, the maximum is %d", label(sourceRel, ""), len(tracks), MaxTracks)
 	}
-	slices.SortFunc(tracks, func(a, b *importFile) int { return pathNaturalCompare(a.src.Rel, b.src.Rel) })
+	slices.SortFunc(tracks, func(a, b *candidateFile) int { return pathNaturalCompare(a.rel, b.rel) })
 	return tracks, others, nil
 }
 
-// buildCandidate infers the metadata (§7.3), associates the LRC files and
-// chooses the cover (§7.4), and assembles the closed input of the commit
-// with its fingerprint (§7.6).
-func (im *Importer) buildCandidate(ctx context.Context, c *jobs.Claim, tracks, others []*importFile) (catalog.ImportCandidate, []jobs.Warning, error) {
+// prepareAlbum infers metadata, associates lyrics and chooses a cover from
+// pinned files. Tracks have been inspected and sorted in natural path
+// order; other files are in path order.
+func (im *Importer) prepareAlbum(ctx context.Context, fallbackTitle string, overrides jobs.Overrides, tracks, others []*candidateFile) (catalog.AlbumCandidate, []jobs.Warning, error) {
 	tags := make([]trackTags, len(tracks))
 	trackPaths := make([]string, len(tracks))
 	for i, t := range tracks {
-		tags[i] = trackTags{Path: t.src.Rel, Disc: t.disc, Tags: t.tags.Managed}
-		trackPaths[i] = t.src.Rel
+		tags[i] = trackTags{Path: t.rel, Disc: t.disc, Tags: t.tags.Managed}
+		trackPaths[i] = t.rel
 	}
-	meta, err := inferMetadata(dirName(c.SourceRel), tags, c.Overrides)
+	meta, err := inferMetadata(fallbackTitle, tags, overrides)
 	if err != nil {
-		return catalog.ImportCandidate{}, nil, err
+		return catalog.AlbumCandidate{}, nil, err
 	}
 	ws := meta.Warnings
 
 	otherPaths := make([]string, len(others))
-	byPath := map[string]*importFile{}
+	byPath := map[string]*candidateFile{}
 	for i, f := range others {
-		otherPaths[i] = f.src.Rel
-		byPath[f.src.Rel] = f
+		otherPaths[i] = f.rel
+		byPath[f.rel] = f
 	}
 	lyrics, err := associateLyrics(trackPaths, otherPaths)
 	if err != nil {
-		return catalog.ImportCandidate{}, ws, err
+		return catalog.AlbumCandidate{}, ws, err
 	}
 	for _, t := range trackPaths {
 		lrc, ok := lyrics[t]
@@ -436,7 +446,7 @@ func (im *Importer) buildCandidate(ctx context.Context, c *jobs.Claim, tracks, o
 		}
 		valid, err := im.blobIsUTF8(ctx, byPath[lrc].blob)
 		if err != nil {
-			return catalog.ImportCandidate{}, ws, err
+			return catalog.AlbumCandidate{}, ws, err
 		}
 		if !valid {
 			delete(lyrics, t)
@@ -445,7 +455,21 @@ func (im *Importer) buildCandidate(ctx context.Context, c *jobs.Claim, tracks, o
 		}
 	}
 
-	// The tracks in their final order, for the embedded pictures (§7.4).
+	var cfs []coverFile
+	for _, f := range others {
+		cfs = append(cfs, coverFile{Path: f.rel, Blob: f.blob})
+	}
+	cover, err := im.chooseCover(ctx, cfs, coverTracks(meta, tracks))
+	ws = append(ws, cover.Warnings...)
+	if err != nil {
+		return catalog.AlbumCandidate{}, ws, err
+	}
+
+	return assemble(meta, tracks, others, lyrics, cover.Cover), ws, nil
+}
+
+// coverTracks orders the embedded pictures by final disc and track number.
+func coverTracks(meta albumMeta, tracks []*candidateFile) []coverTrack {
 	order := make([]int, len(tracks))
 	for i := range order {
 		order[i] = i
@@ -456,20 +480,9 @@ func (im *Importer) buildCandidate(ctx context.Context, c *jobs.Claim, tracks, o
 	cts := make([]coverTrack, len(tracks))
 	for i, k := range order {
 		t := tracks[k]
-		cts[i] = coverTrack{Path: t.src.Rel, Blob: t.blob, Format: t.format, Pictures: t.tags.Pictures}
+		cts[i] = coverTrack{Path: t.rel, Blob: t.blob, Format: t.format, Pictures: t.tags.Pictures}
 	}
-	var cfs []coverFile
-	for _, f := range others {
-		cfs = append(cfs, coverFile{Path: f.src.Rel, Blob: f.blob})
-	}
-	cover, err := im.chooseCover(ctx, cfs, cts)
-	ws = append(ws, cover.Warnings...)
-	if err != nil {
-		return catalog.ImportCandidate{}, ws, err
-	}
-
-	cand, err := assemble(c, meta, tracks, others, lyrics, cover.Cover)
-	return cand, ws, err
+	return cts
 }
 
 // dirName is the name of the candidate's directory, "" for /import itself:
@@ -492,14 +505,12 @@ func (im *Importer) blobIsUTF8(ctx context.Context, b blobstore.Blob) (bool, err
 	return ok, errors.Join(err, closeErr(f, "blob "+b.SHA256))
 }
 
-// assemble builds the closed input of catalog.CommitImport: every blob once
-// with its content-derived format (audio from the probe, the cover from its
-// decode, anything else unknown: N-118) and, for a track, the duration its
-// probe read (N-300), the tracks by disc and number, the
-// attachments by path, and the fingerprint of every file (§7.6).
-func assemble(c *jobs.Claim, meta albumMeta, tracks, others []*importFile, lyrics map[string]string, cover *catalog.Blob) (catalog.ImportCandidate, error) {
-	cand := catalog.ImportCandidate{
-		Attempt: c.Attempt, Artist: meta.Artist, Title: meta.Title, Year: meta.Year, Genre: meta.Genre,
+// assemble builds the album content: every referenced blob once with its
+// content-derived format and any probed duration, the tracks by disc and
+// number, and the attachments by path.
+func assemble(meta albumMeta, tracks, others []*candidateFile, lyrics map[string]string, cover *catalog.Blob) catalog.AlbumCandidate {
+	cand := catalog.AlbumCandidate{
+		Artist: meta.Artist, Title: meta.Title, Year: meta.Year, Genre: meta.Genre,
 		Compilation: meta.Compilation,
 	}
 	blobs := map[string]catalog.Blob{}
@@ -508,15 +519,12 @@ func assemble(c *jobs.Claim, meta albumMeta, tracks, others []*importFile, lyric
 			blobs[b.SHA256] = catalog.Blob{Hash: b.SHA256, Size: b.Size, Format: format}
 		}
 	}
-	var entries []fingerprintEntry
-	lrcFiles := map[string]*importFile{}
+	lrcFiles := map[string]*candidateFile{}
 	for _, f := range others {
-		entries = append(entries, fingerprintEntry{Path: f.src.Rel, Size: f.blob.Size, Hash: f.blob.SHA256})
-		lrcFiles[f.src.Rel] = f
+		lrcFiles[f.rel] = f
 	}
 	associated := map[string]bool{}
 	for i, t := range tracks {
-		entries = append(entries, fingerprintEntry{Path: t.src.Rel, Size: t.blob.Size, Hash: t.blob.SHA256})
 		add(t.blob, t.format)
 		if ms, ok := media.DurationMS(t.duration); ok {
 			b := blobs[t.blob.SHA256]
@@ -526,7 +534,7 @@ func assemble(c *jobs.Claim, meta albumMeta, tracks, others []*importFile, lyric
 		m := meta.Tracks[i]
 		it := catalog.ImportTrack{SourcePath: m.Path, Disc: m.Disc, No: m.No, Title: m.Title,
 			Artist: m.Artist, Genre: m.Genre, BlobHash: t.blob.SHA256}
-		if lrc, ok := lyrics[t.src.Rel]; ok {
+		if lrc, ok := lyrics[t.rel]; ok {
 			associated[lrc] = true
 			it.Lyrics = &catalog.ImportLyrics{SourcePath: lrc, BlobHash: lrcFiles[lrc].blob.SHA256}
 			add(lrcFiles[lrc].blob, "")
@@ -537,10 +545,10 @@ func assemble(c *jobs.Claim, meta albumMeta, tracks, others []*importFile, lyric
 		return cmp.Or(cmp.Compare(a.Disc, b.Disc), cmp.Compare(a.No, b.No))
 	})
 	for _, f := range others {
-		if associated[f.src.Rel] {
+		if associated[f.rel] {
 			continue
 		}
-		cand.Attachments = append(cand.Attachments, catalog.ImportAttachment{RelPath: f.src.Rel, BlobHash: f.blob.SHA256})
+		cand.Attachments = append(cand.Attachments, catalog.ImportAttachment{RelPath: f.rel, BlobHash: f.blob.SHA256})
 		add(f.blob, "")
 	}
 	if cover != nil {
@@ -551,12 +559,7 @@ func assemble(c *jobs.Claim, meta albumMeta, tracks, others []*importFile, lyric
 		cand.Blobs = append(cand.Blobs, b)
 	}
 	slices.SortFunc(cand.Blobs, func(a, b catalog.Blob) int { return strings.Compare(a.Hash, b.Hash) })
-	fp, err := fingerprint(entries)
-	if err != nil {
-		return catalog.ImportCandidate{}, err
-	}
-	cand.Fingerprint = fp
-	return cand, nil
+	return cand
 }
 
 // genreWarnings reports each genre read from an MP3 that an MP3 cannot hold

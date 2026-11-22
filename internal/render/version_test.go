@@ -87,7 +87,7 @@ func TestVersionInputs(t *testing.T) {
 // review, together with its consequence (§11.1 step 6: every album renders
 // again at the next boot).
 func TestVersionGolden(t *testing.T) {
-	const want = "musiclib-render/3 names/1 go1.25.14 ffmpeg/8.1.3-musiclib1 musiclib-tags/4 taglib/2.3.2-musiclib1"
+	const want = "musiclib-render/4 names/1 go1.25.14 ffmpeg/8.1.3-musiclib1 musiclib-tags/4 taglib/2.3.2-musiclib1"
 	if Version != want {
 		t.Fatalf("render_version is %q, pinned %q: update the pin knowing that every album will render again", Version, want)
 	}
@@ -164,6 +164,7 @@ var rendererDigests = map[string]string{
 	"1": "01d38d79f5433acd1be4a0a21cb67a1b7520ecd0b2999949194981c60b006446",
 	"2": "698ef861981a333d3fe0505697ba60c626621b103fbe9987e7d67f42a41eaa71",
 	"3": "c8a7c6ca2224add79a331bb1702c2e199d8aae175f5e68f800eceeb0a9888a99",
+	"4": "fbdf53e9b8a951f0007f354caae7e2addd7037d822f3a353ca14e466641634fd",
 }
 
 // TestRendererRevisionPinned fails when the planner's layout or tag mapping,
@@ -216,7 +217,7 @@ func rendererTranscript(t *testing.T, w io.Writer) {
 		}
 		fmt.Fprintf(w, "files %q\n", p.Files())
 	}
-	r := goldenReceipt()
+	r := goldenV2Receipt()
 	r.AlbumID, r.BuildID = uuid.MustParse("00000000-0000-7000-8000-000000000001"), uuid.MustParse("00000000-0000-7000-8000-000000000002")
 	enc, err := r.Encode()
 	if err != nil {

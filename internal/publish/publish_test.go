@@ -214,7 +214,7 @@ func TestPublishAnotherAlbumsReceiptRefused(t *testing.T) {
 	id := e.importAlbum("Artist", "Album")
 	e.mustPublish("v1")
 	// Replace the album's receipt with one of another album.
-	other := render.Receipt{AlbumID: uuid.New(), BuildID: uuid.New(), AlbumRevision: 1, RenderVersion: render.Version}
+	other := render.Receipt{SchemaVersion: render.ReceiptSchemaVersion, StoreID: e.p.storeID, AlbumID: uuid.New(), BuildID: uuid.New(), AlbumRevision: 1, RenderVersion: render.Version}
 	b, err := other.Encode()
 	if err != nil {
 		t.Fatal(err)
@@ -239,6 +239,60 @@ func TestPublishAnotherAlbumsReceiptRefused(t *testing.T) {
 
 // At the album's own published path, a missing receipt or an altered file
 // is output damage: the build replaces the directory (§9.3).
+func TestPublishRefusesForeignStore(t *testing.T) {
+	for _, location := range []string{"same path", "old path", "staging"} {
+		t.Run(location, func(t *testing.T) {
+			e := newEnv(t)
+			id := e.importAlbum("Artist", "Album")
+			_, old := e.mustPublish("old")
+			if location == "old path" {
+				e.trash(id)
+			} else {
+				e.bump(id)
+			}
+			snap := e.claim().Render
+			next := e.stage(snap, "next")
+			dir := "library/" + old.Dir
+			if location == "staging" {
+				dir = "work/" + next.Staging
+				next.ReceiptHash = e.foreignReceipt(dir)
+			} else {
+				e.foreignReceipt(dir)
+			}
+			before := e.tree(dir)
+			_, err := e.p.Publish(t.Context(), snap, next)
+			wantCode(t, err, CodeForeignOutput)
+			e.wantTree(dir, before)
+			if _, ok := e.journal(); ok || deref(e.album(id).PublishedBuild) != old.BuildID {
+				t.Fatal("foreign output changed publication state")
+			}
+		})
+	}
+}
+
+func TestCleanWorkPreservesForeignStore(t *testing.T) {
+	e := newEnv(t)
+	e.importAlbum("Artist", "Album")
+	snap := e.claim().Render
+	local := e.stage(snap, "local")
+	staged := e.stage(snap, "foreign staging")
+	retired := e.stage(snap, "foreign retired")
+	stagePath := "work/" + staged.Staging
+	retiredPath := "work/retired/" + retired.BuildID.String()
+	if err := os.Rename(e.path("work/"+retired.Staging), e.path(retiredPath)); err != nil {
+		t.Fatal(err)
+	}
+	e.foreignReceipt(stagePath)
+	e.foreignReceipt(retiredPath)
+	stageTree, retiredTree := e.tree(stagePath), e.tree(retiredPath)
+	removed, err := e.p.CleanWork(t.Context())
+	if err != nil || e.exists("work/"+buildDir(local.BuildID)) {
+		t.Fatalf("CleanWork: %v, %v", removed, err)
+	}
+	e.wantTree(stagePath, stageTree)
+	e.wantTree(retiredPath, retiredTree)
+}
+
 func TestPublishReplacesDamagedOwnOutput(t *testing.T) {
 	for _, damage := range []string{"receipt removed", "file altered", "file added", "receipt garbage"} {
 		t.Run(damage, func(t *testing.T) {

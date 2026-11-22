@@ -5,9 +5,17 @@ Versions follow [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+
+- **Create album** opens a dedicated page from the sidebar. Pick or drop individual audio files into a local draft, adjust metadata if needed, and optionally add a cover with a local preview. Confirmation fully verifies the audio and saves the complete album at revision 1 with one queued render (`POST /api/albums`). A refused submission leaves no partial catalog entry; originals already received are kept. An uncertain reply can be checked using the same album ID.
+- The standalone `musiclib` maintenance command runs `backup`, `restore`, `doctor` and `rebuild` against the installation's Compose project. Backup takes the app offline and restarts it after success only if it was running. Restore requires empty destinations and starts the app only after the offline restore succeeds. The manual procedures remain available for 1.2.0.
+
 ### Changed
 
+- New publications write receipt schema 2 with store lineage and stable track IDs, plus each track's original hash alongside its independently computed published hash. Canonical v1 receipts and pending v1 publications remain readable. The renderer revision is now 4: after recovery, stale output is replaced by normal whole-album renders. Back up before upgrading and allow time and space for those renders. Restore preserves lineage; rollback requires a compatible pre-upgrade backup in a fresh environment, not an older binary over newer output.
+
 - The install block and the guides use the folder `~/vibrance` instead of `~/musiclib`. An existing installation keeps working where it is: run its commands from its own folder.
+- Removed the fixed byte ceiling for CSS and JavaScript from the contributor rules. Server upload limits are unchanged.
 
 ## [1.2.0] - 2026-10-01
 

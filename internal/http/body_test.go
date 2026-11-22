@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	nethttp "net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -54,7 +55,7 @@ func TestCheckJSON(t *testing.T) {
 
 		{"duplicate key", `{"a":1,"a":2}`, CodeDuplicateKey, "a"},
 		{"duplicate key, same value", `{"a":1,"a":1}`, CodeDuplicateKey, "a"},
-		{"duplicate key after escaping", `{"a":1,"a":2}`, CodeDuplicateKey, "a"},
+		{"duplicate key after escaping", `{"a":1,"\u0061":2}`, CodeDuplicateKey, "a"},
 		{"duplicate key nested", `{"a":{"b":1,"c":2,"b":3}}`, CodeDuplicateKey, "a.b"},
 		{"duplicate key in an array", `{"tracks":[{"id":1},{"id":2,"id":3}]}`, CodeDuplicateKey, "tracks[1].id"},
 		{"duplicate key deep", `{"x":[[{"y":[{"z":1,"z":1}]}]]}`, CodeDuplicateKey, "x[0][0].y[0].z"},
@@ -79,6 +80,34 @@ func TestCheckJSON(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestJSONDiagnosticsBounded(t *testing.T) {
+	// A wide array under one large key must not copy that key for each child.
+	prefix := `{"` + strings.Repeat("🎵", 1<<18) + `":[` + strings.Repeat(`{},`, 128)
+	raw := []byte(prefix + `{}]}`)
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	e := checkJSONDepth(raw, 16)
+	if e == nil {
+		_, e = decodeObject(raw, "", creationKeys...)
+	}
+	runtime.ReadMemStats(&after)
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 16*uint64(len(raw)) {
+		t.Fatalf("processing %d input bytes allocated %d bytes", len(raw), allocated)
+	}
+	check := func(e *Error, code string) {
+		t.Helper()
+		if e == nil || e.Code != code {
+			t.Fatalf("error = %v, want %s", e, code)
+		}
+		field, _ := e.Details["field"].(string)
+		if len(field) > maxJSONFieldBytes || !utf8.ValidString(field) || !strings.HasSuffix(field, "…") || !strings.HasPrefix(field, "🎵") || len(e.Message) > 2*maxJSONFieldBytes {
+			t.Fatalf("expected bounded UTF-8 diagnostic, got %d field bytes and %d message bytes", len(field), len(e.Message))
+		}
+	}
+	check(e, CodeUnknownField)
+	check(checkJSONDepth([]byte(prefix+`{"a":1,"a":2}]}`), 16), CodeDuplicateKey)
 }
 
 // The schema-level rules: exact keys (not encoding/json's case-insensitive

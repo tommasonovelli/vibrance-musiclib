@@ -3,11 +3,13 @@ package publish
 import (
 	"context"
 	"errors"
+	"path"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
 	"musiclib/internal/fsops"
+	"musiclib/internal/render"
 	"musiclib/internal/store"
 )
 
@@ -73,8 +75,8 @@ func (p *Publisher) recoverLocked(ctx context.Context) (*Journal, error) {
 // CleanWork is the part of §11.1 step 5 that belongs to the publisher: it
 // removes every build in work/render and every directory in work/retired
 // that no journal references, and returns their paths relative to work/.
-// It runs after Recover and before any worker, so no build is in progress;
-// after a successful Recover no journal is left, and everything goes.
+// It runs after Recover and before any worker, so no build is in progress.
+// Valid output from another store is left in place for inspection.
 func (p *Publisher) CleanWork(ctx context.Context) ([]string, error) {
 	keep := uuid.Nil
 	row, found, err := p.readJournal(ctx)
@@ -93,17 +95,27 @@ func (p *Publisher) CleanWork(ctx context.Context) ([]string, error) {
 		if err != nil {
 			return removed, err
 		}
+		before := len(removed)
 		for _, e := range ents {
 			if keep != uuid.Nil && e.Name == keep.String() {
 				continue
 			}
 			rel := dir + "/" + e.Name
-			if err := p.work.RemoveAll(ctx, rel); err != nil {
+			receiptDir := rel
+			if dir != retiredDir {
+				receiptDir += "/" + path.Base(render.StagingDir(uuid.Nil))
+			}
+			err := p.removeWork(ctx, rel, receiptDir)
+			if Code(err) == CodeForeignOutput {
+				p.log.Warn("leaving foreign output in work", "path", rel, "error", err.Error())
+				continue
+			}
+			if err != nil {
 				return removed, err
 			}
 			removed = append(removed, rel)
 		}
-		if len(removed) > 0 {
+		if len(removed) > before {
 			if err := p.work.SyncDir(dir); err != nil {
 				return removed, err
 			}

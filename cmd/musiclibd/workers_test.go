@@ -809,7 +809,11 @@ func TestBootFailsOnARecoveryIOError(t *testing.T) {
 	body := []byte("audio")
 	writeFile(t, filepath.Join(staging, "01 - One.flac"), string(body))
 	sum := sha256.Sum256(body)
-	receipt, err := render.Receipt{AlbumID: id, BuildID: build, AlbumRevision: 1, RenderVersion: render.Version,
+	storeID, err := store.New(db).GetStoreID(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := render.Receipt{SchemaVersion: render.ReceiptSchemaVersion, StoreID: storeID, AlbumID: id, BuildID: build, AlbumRevision: 1, RenderVersion: render.Version,
 		Files: []render.ReceiptFile{{RelativePath: "01 - One.flac", Size: int64(len(body)), SHA256: hex.EncodeToString(sum[:])}}}.Encode()
 	if err != nil {
 		t.Fatal(err)

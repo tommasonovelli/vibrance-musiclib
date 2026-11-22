@@ -1,0 +1,82 @@
+{{define "body"}}{{with .Draft}}
+<noscript><p>Turn on JavaScript to create an album from files.</p></noscript>
+<canvas id="draft-glow" width="1" height="1" aria-hidden="true"></canvas>
+<form id="draft" data-id="{{.ID}}" autocomplete="off" method="post" hidden>
+<p class="draft-intro">Build an album from individual audio files. Your draft stays in this tab until you choose <strong>Create album</strong>.</p>
+<fieldset id="draft-fields">
+<legend class="sr-only">Album draft</legend>
+<div class="draft-grid">
+<section class="draft-section draft-tracks" aria-labelledby="draft-tracks-title">
+<div class="draft-heading"><h2 id="draft-tracks-title">Tracks</h2><p id="draft-count" class="count" role="status">0 tracks</p></div>
+<div class="draft-picker">
+<svg class="icon" width="20" height="20" aria-hidden="true"><use href="#i-import"/></svg>
+<div><button id="pick-tracks" class="btn" type="button" aria-describedby="track-formats">Add audio files</button>
+<input id="draft-files" type="file" accept=".flac,.mp3,.m4a" multiple hidden>
+<p id="track-formats" class="menu-note">Or drop FLAC, MP3 or M4A files here.</p></div>
+</div>
+<div id="draft-track-error" class="notice" role="alert" tabindex="-1" hidden></div>
+<p id="draft-inference" class="menu-note" hidden>Open a track’s details to override its tags. Blank fields are filled from tags and filenames where possible.</p>
+<ol id="draft-tracks" role="list" hidden></ol>
+</section>
+<div class="draft-side">
+<section class="draft-section" aria-labelledby="draft-album-title">
+<h2 id="draft-album-title">Album details</h2>
+<p class="menu-note">Album artist and title are required.</p>
+<label>Album artist<select name="artist_choice" required>{{if .Artists}}<option value="">Choose or enter an artist…</option>{{end}}<option value="name">Use or create artist by name</option>{{range .Artists}}<option value="{{.ID}}">{{.Name}}</option>{{end}}</select></label>
+<div id="draft-artist" hidden>
+<label>Artist name<input name="artist_name" aria-describedby="draft-artist-note" required disabled></label>
+<p id="draft-artist-note" class="menu-note">An exact name match uses the existing artist.</p>
+</div>
+<div id="draft-album" class="draft-form-grid">
+<label class="draft-wide">Album title<input name="title" required></label>
+<label>Year<input name="year" type="number" min="1" max="9999" placeholder="Auto"></label>
+<label>Genre<input name="genre" placeholder="Auto"></label>
+</div>
+<p class="menu-note">Leave year and genre blank to use track tags when possible.</p>
+<label class="check"><input name="compilation" type="checkbox">Compilation</label>
+</section>
+<section class="draft-section" aria-labelledby="draft-cover-title">
+<div class="draft-heading"><h2 id="draft-cover-title">Cover</h2><span class="menu-note">Optional</span></div>
+<div id="draft-cover-drop">
+<p id="draft-art-note" aria-hidden="true">Drop one JPEG or PNG</p>
+<canvas id="draft-art" width="1" height="1" aria-hidden="true" hidden></canvas>
+</div>
+<div class="draft-actions">
+<button id="pick-cover" class="btn" type="button" aria-describedby="draft-cover-note">Choose cover</button>
+<input id="draft-cover" type="file" accept="image/jpeg,image/png,.jpg,.jpeg,.png" hidden>
+<button id="clear-cover" class="link" type="button" hidden>Remove cover</button>
+</div>
+<div>
+<p id="draft-cover-note" class="menu-note">Choose or drop one JPEG or PNG. With no selection, MusicLib looks for embedded artwork.</p>
+<p class="file-name" id="draft-cover-name" role="status"></p>
+</div>
+<div id="draft-cover-error" class="notice" role="alert" tabindex="-1" hidden></div>
+</section>
+</div>
+</div>
+</fieldset>
+<section class="draft-confirm" aria-label="Confirm album">
+<p class="draft-confirm-note">MusicLib uploads and checks every track before saving the album. Publication runs separately in <a href="/activity">Activity</a>.</p>
+<p class="menu-note">Originals already stored are kept even if the request is stopped or the album isn’t saved.</p>
+<p id="draft-status" role="status" tabindex="-1"></p>
+<div id="draft-error" class="notice" tabindex="-1" role="alert" hidden><p></p><details hidden><summary>Details</summary><pre></pre></details><a id="draft-existing" href="/albums/{{.ID}}" hidden>Open the existing album</a></div>
+<div class="draft-actions">
+<button id="create-album" class="btn btn-primary" type="submit">Create album</button>
+<button id="stop-create" class="btn" type="button" hidden>Stop confirmation</button>
+<a id="cancel-draft" class="link" href="/">Cancel draft</a>
+</div>
+</section>
+</form>
+<template id="draft-track"><li><fieldset><legend class="sr-only"></legend>
+<div class="draft-track-head"><svg class="icon" width="20" height="20" aria-hidden="true"><use href="#i-file"/></svg><bdi class="file-name"></bdi>
+<button class="link" type="button">Remove<span class="sr-only"></span></button></div>
+<details><summary>Track details</summary><div class="draft-form-grid">
+<label class="draft-wide">Title<input name="title"></label>
+<label>Disc<input name="disc" type="number" min="1" max="99"></label>
+<label>Number<input name="number" type="number" min="1" max="999"></label>
+<label class="draft-wide">Artist<input name="artist"></label>
+<label class="draft-wide">Genre<input name="genre"></label>
+<label class="check draft-wide"><input name="nogenre" type="checkbox">No genre</label>
+</div></details>
+</fieldset></li></template>
+{{end}}{{end}}

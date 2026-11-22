@@ -7,7 +7,7 @@
 #            then the `runtime` image for linux/amd64, pushed to GHCR with its
 #            SBOM and provenance; a version already in the registry is refused
 #   release  smoke test of the pushed digest, then the GitHub Release with
-#            compose.yaml, .env.example, THIRD_PARTY_NOTICES.md and the
+#            compose.yaml, musiclib, env.example, THIRD_PARTY_NOTICES.md and the
 #            FFmpeg and TagLib source tarballs
 #
 # Every third-party action is pinned by commit SHA, and so are the BuildKit
@@ -268,6 +268,7 @@ jobs:
           assets="${RUNNER_TEMP}/assets"
           mkdir -p "${assets}"
           cp compose.yaml "${assets}/compose.yaml"
+          install -m 755 musiclib "${assets}/musiclib"
           # GitHub renames asset names that start with a dot.
           cp .env.example "${assets}/env.example"
 
@@ -312,18 +313,49 @@ jobs:
           - Digest: `@DIGEST@`
           - Pinned by digest: `@PINNED@`
 
-          ### Install
+          ### Prepare the release files (do not start yet)
 
-          Docker Engine with the Compose v2 plugin, Linux amd64, `/data` on local ext4. The block creates `~/vibrance`, writes a random database password (instead of the default `musiclib`) and a random sign-in password into `.env`, and starts MusicLib:
+          Docker Engine with the Compose v2 plugin, Linux amd64, `/data` on local ext4. This block prepares a fresh folder at `~/vibrance`, writes random passwords into `.env`, and does not start anything. Change `dir` to prepare a separate folder for a restore. For an existing installation, see the [upgrade guide](@GUIDE@#upgrading).
 
           ```sh
-          mkdir -p ~/vibrance/import && cd ~/vibrance
-          [ -e compose.yaml ] || curl -fsSLO @DOWNLOAD@/compose.yaml
-          [ -e .env ] || { curl -fsSL -o .env @DOWNLOAD@/env.example && chmod 600 .env && sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$(openssl rand -hex 32)/" .env && sed -i "s|^MUSICLIB_PASSWORD=.*|MUSICLIB_PASSWORD=$(openssl rand -base64 24)|" .env; }
-          docker compose up -d --wait
+          (
+            set -e
+            dir=~/vibrance
+            mkdir -p "$dir/import"
+            cd "$dir"
+            for file in compose.yaml musiclib .env; do
+              if [ -e "$file" ] || [ -L "$file" ]; then
+                printf '%s\n' 'Use a fresh folder or follow the upgrade guide.' >&2
+                exit 1
+              fi
+            done
+            tmp=$(mktemp -d .musiclib-download.XXXXXX)
+            trap 'rm -rf -- "$tmp"' EXIT
+            curl -fsSL -o "$tmp/compose.yaml" @DOWNLOAD@/compose.yaml
+            curl -fsSL -o "$tmp/musiclib" @DOWNLOAD@/musiclib
+            curl -fsSL -o "$tmp/.env" @DOWNLOAD@/env.example
+            chmod 644 "$tmp/compose.yaml"
+            chmod 755 "$tmp/musiclib"
+            chmod 600 "$tmp/.env"
+            db_password=$(openssl rand -hex 32)
+            app_password=$(openssl rand -base64 24)
+            sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$db_password/" "$tmp/.env"
+            sed -i "s|^MUSICLIB_PASSWORD=.*|MUSICLIB_PASSWORD=$app_password|" "$tmp/.env"
+            mv -f -- "$tmp/compose.yaml" compose.yaml
+            mv -f -- "$tmp/musiclib" musiclib
+            mv -f -- "$tmp/.env" .env
+          )
           ```
 
-          Then open http://127.0.0.1:8080/ and sign in with the password in `.env`: `grep MUSICLIB_PASSWORD .env`. Upgrading from 1.0.0, settings and backups: @GUIDE@
+          ### Start a new installation
+
+          Configure [host folders](@GUIDE@#the-data-in-a-host-folder) first if you want them. **Do not run this startup block for a restore**; follow the [restore procedure](@GUIDE@#restore-use-new-empty-destinations) instead.
+
+          ```sh
+          cd ~/vibrance && docker compose up -d --wait
+          ```
+
+          Then open http://127.0.0.1:8080/ and sign in with the password in `.env`: `grep MUSICLIB_PASSWORD .env`. See the [operations guide](@GUIDE@) for settings, backups and maintenance.
           EOF
           )"
           image_notes="${image_notes//@TAGGED@/${IMAGE}:${VERSION}}"

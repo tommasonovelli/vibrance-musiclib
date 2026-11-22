@@ -62,12 +62,13 @@ type readTrack struct {
 	disc                                     int
 	// discDir is true when disc is the disc directory's number; tagDisc is
 	// then the positive disc tag, 0 without one (N-185).
-	discDir     bool
-	tagDisc     int
-	track       int
-	trackOK     bool
-	year        int
-	compilation bool
+	discDir        bool
+	tagDisc        int
+	track          int
+	trackOK        bool
+	explicitNumber bool
+	year           int
+	compilation    bool
 }
 
 // inferMetadata is the table of §7.3, a pure function of the tracks' tags,
@@ -75,7 +76,6 @@ type readTrack struct {
 // /import itself) and the user's overrides. tracks must be sorted by
 // pathNaturalCompare. It does no I/O; every order it uses is explicit.
 func inferMetadata(dirName string, tracks []trackTags, ov jobs.Overrides) (albumMeta, error) {
-	var m albumMeta
 	rs := make([]readTrack, len(tracks))
 	for i, t := range tracks {
 		var err error
@@ -83,6 +83,11 @@ func inferMetadata(dirName string, tracks []trackTags, ov jobs.Overrides) (album
 			return albumMeta{}, err
 		}
 	}
+	return inferReadMetadata(dirName, rs, ov)
+}
+
+func inferReadMetadata(dirName string, rs []readTrack, ov jobs.Overrides) (albumMeta, error) {
+	var m albumMeta
 	var err error
 	if m.Title, err = albumTitle(dirName, rs, ov.Title); err != nil {
 		return albumMeta{}, err
@@ -348,11 +353,12 @@ func discTagWarnings(rs []readTrack) []jobs.Warning {
 	return ws
 }
 
-// numberTracks sets the track numbers (§7.3), disc by disc: the tags when
-// every track of the disc has a positive number and they are distinct;
-// otherwise the whole disc is numbered 1..n in the natural order of the
-// basenames, ties by the full path, with a warning. The warning's path is
-// the disc directory in a multi-disc candidate, and empty otherwise.
+// numberTracks assigns each disc independently. Browser overrides reserve
+// their numbers first. If all other numbers are positive and distinct from
+// each other and the reservations, keep them; otherwise assign those tracks
+// the lowest free numbers in natural filename order. Directory imports have
+// no reservations and use the same fallback for the entire disc. The
+// warning's path is the disc directory in a multi-disc import, or empty.
 func numberTracks(rs []readTrack, ts []trackMeta) ([]jobs.Warning, error) {
 	discs := map[int][]int{}
 	for i, r := range rs {
@@ -366,31 +372,52 @@ func numberTracks(rs []readTrack, ts []trackMeta) ([]jobs.Warning, error) {
 	var ws []jobs.Warning
 	for _, d := range order {
 		idx := discs[d]
+		reserved := map[int]string{}
+		var inferred []int
+		for _, i := range idx {
+			r := rs[i]
+			if !r.explicitNumber {
+				inferred = append(inferred, i)
+				continue
+			}
+			if first, used := reserved[r.track]; used {
+				return nil, &catalog.Error{Code: catalog.CodeDuplicateTrackNumber,
+					Message: fmt.Sprintf("%q and %q both specify disc %d track %d", first, r.path, d, r.track),
+					Details: catalog.Details{Names: []string{first, r.path}}}
+			}
+			reserved[r.track], ts[i].No = r.path, r.track
+		}
 		seen := map[int]bool{}
 		ok := true
-		for _, i := range idx {
-			if !rs[i].trackOK || seen[rs[i].track] {
+		for _, i := range inferred {
+			r := rs[i]
+			if _, used := reserved[r.track]; used || !r.trackOK || seen[r.track] {
 				ok = false
 				break
 			}
-			seen[rs[i].track] = true
+			seen[r.track] = true
 		}
 		if ok {
-			for _, i := range idx {
+			for _, i := range inferred {
 				ts[i].No = rs[i].track
 			}
 			continue
 		}
-		slices.SortFunc(idx, func(a, b int) int { return pathNaturalCompare(rs[a].path, rs[b].path) })
 		if len(idx) > catalog.MaxTrackNumber {
 			return nil, &Error{Code: catalog.CodeInvalidTrackNumber,
 				Message: fmt.Sprintf("disc %d has %d tracks, more than the %d track numbers", d, len(idx), catalog.MaxTrackNumber)}
 		}
-		for n, i := range idx {
-			ts[i].No = n + 1
+		slices.SortFunc(inferred, func(a, b int) int { return pathNaturalCompare(rs[a].path, rs[b].path) })
+		n := 1
+		for _, i := range inferred {
+			for reserved[n] != "" {
+				n++
+			}
+			ts[i].No = n
+			n++
 		}
-		ws = append(ws, jobs.Warning{Code: jobs.WarnTracksRenumbered, Path: renumberedPath(rs[idx[0]]),
-			Message: fmt.Sprintf("disc %d: the track numbers are missing, not positive or repeated; the %d tracks are numbered by file name", d, len(idx))})
+		ws = append(ws, jobs.Warning{Code: jobs.WarnTracksRenumbered, Path: renumberedPath(rs[inferred[0]]),
+			Message: fmt.Sprintf("disc %d: the track numbers are missing, not positive or repeated; the %d tracks are numbered by file name", d, len(inferred))})
 	}
 	return ws, nil
 }

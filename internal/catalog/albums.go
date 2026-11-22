@@ -480,18 +480,25 @@ func checkGenres(ctx context.Context, tx *store.CatalogTx, albumID uuid.UUID, f 
 	if err != nil {
 		return dbErr("listing the audio formats of album "+albumID.String(), err)
 	}
-	var genres []string
-	if f.Genre != nil && *f.Genre != "" {
-		genres = append(genres, *f.Genre)
-	}
+	var genres []*string
 	for _, t := range tracks {
-		if t.Genre != nil && *t.Genre != "" {
-			genres = append(genres, *t.Genre)
-		}
+		genres = append(genres, t.Genre)
 	}
+	return checkGenreFormats(formats, f.Genre, genres, genreFits)
+}
+
+func checkGenreFormats(formats []*string, albumGenre *string, trackGenres []*string, genreFits GenreFits) error {
 	for _, format := range formats {
-		for _, g := range genres {
-			if err := genreFits(g, *format); err != nil {
+		if albumGenre != nil && *albumGenre != "" {
+			if err := genreFits(*albumGenre, *format); err != nil {
+				return err
+			}
+		}
+		for _, g := range trackGenres {
+			if g == nil || *g == "" {
+				continue
+			}
+			if err := genreFits(*g, *format); err != nil {
 				return err
 			}
 		}

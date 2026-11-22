@@ -7,6 +7,17 @@ const base = `/api/albums/${editor.dataset.id}`;
 const json = JSON.stringify, on = (type, f) => document.addEventListener(type, f);
 let etag = editor.dataset.etag, saved, target, shown = false, busy, timer, moving;
 
+try {
+  const key = 'creation-warnings';
+  const { id, notes } = JSON.parse(sessionStorage.getItem(key)) || {};
+  if (id === editor.dataset.id) {
+    sessionStorage.removeItem(key);
+    const box = $('#creation-warnings'), list = $('ul', box);
+    for (const text of notes) list.appendChild(document.createElement('li')).textContent = text;
+    box.hidden = !notes.length;
+  }
+} catch { /* Storage is optional. */ }
+
 // Edits: named form controls by track and name; «No genre» joins its genre.
 const fields = () => [...$('#metadata').elements].filter(f => f.name);
 const key = f => (f.closest('[data-track]')?.dataset.track || '') + f.name;

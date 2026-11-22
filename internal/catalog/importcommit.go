@@ -48,22 +48,29 @@ var (
 // fingerprint is already an album (§7.6).
 const CodeDuplicateImport = "duplicate_import"
 
-// ImportCandidate is what the importer hands to the import commit (§7.6):
-// one album, fully read, every blob already durable in originals/ (§7.5).
-// Every source path is relative to the candidate's root, exactly as on disk
-// (§5.2); the overrides of §7.3 are already applied to Artist and Title.
-//
-// The commit validates it against the domain rules and never inspects
-// media: the importer has already read, verified and chosen everything
-// (§7.3, §7.4, §7.6), including the owner's decisions N-091 (the cover must
-// be embeddable in every audio format of the album, asked here through the
-// service's CoverFits) and N-092 (a file with invalid UTF-8 in an unmanaged
-// field is refused by the importer, before the commit).
+// ImportCandidate is the directory import's album content and job data.
+// Its content fields remain flat for existing import callers.
 type ImportCandidate struct {
-	// Attempt is the running import job's attempt (jobs.Claim).
-	Attempt jobs.Attempt
-	// Fingerprint is §7.6's SHA-256 of the candidate's file list.
+	Attempt     jobs.Attempt
 	Fingerprint string
+	Warnings    []jobs.Warning
+
+	Blobs       []Blob
+	Artist      string
+	Title       string
+	Year        *int
+	Genre       *string
+	Compilation bool
+	CoverHash   *string
+	Tracks      []ImportTrack
+	Attachments []ImportAttachment
+}
+
+// AlbumCandidate is server-prepared album content. Every referenced blob
+// is already durable, and media inspection has finished. Source paths are
+// relative to the candidate's root. Metadata has been inferred and any
+// overrides applied; the catalog normalizes and validates it before writing.
+type AlbumCandidate struct {
 	// Blobs lists every blob referenced below, once each.
 	Blobs       []Blob
 	Artist      string
@@ -76,8 +83,6 @@ type ImportCandidate struct {
 	CoverHash   *string
 	Tracks      []ImportTrack
 	Attachments []ImportAttachment
-	// Warnings are stored with the job's outcome (§7.2, §7.3).
-	Warnings []jobs.Warning
 }
 
 // Blob is a pinned blob with its content-derived format ("" for any other
@@ -158,7 +163,7 @@ type ImportOutcome struct {
 // committed, except for store.CodeCommitUncertain; store.IsFatal tells the
 // cases of §6.4.
 func (s *Service) CommitImport(ctx context.Context, c ImportCandidate) (ImportOutcome, error) {
-	plan, invalid := validateCandidate(c, s.coverFits)
+	plan, invalid := validateImport(c, s.coverFits)
 	var out ImportOutcome
 	err := store.InCatalogTx(ctx, s.db, func(tx *store.CatalogTx) error {
 		var err error
@@ -176,7 +181,7 @@ func (s *Service) CommitImport(ctx context.Context, c ImportCandidate) (ImportOu
 
 // commitImport is CommitImport's transaction. invalid is the candidate's
 // validation error, plan its validated form when invalid is nil.
-func commitImport(ctx context.Context, tx *store.CatalogTx, c ImportCandidate, plan *importPlan, invalid error) (ImportOutcome, error) {
+func commitImport(ctx context.Context, tx *store.CatalogTx, c ImportCandidate, plan *albumPlan, invalid error) (ImportOutcome, error) {
 	st, err := jobs.LockStatus(ctx, tx, c.Attempt.JobID)
 	if err != nil {
 		return ImportOutcome{}, err
@@ -206,8 +211,9 @@ func commitImport(ctx context.Context, tx *store.CatalogTx, c ImportCandidate, p
 			return ImportOutcome{}, dbErr("looking up the import fingerprint", err)
 		}
 	}
+	var artist artistRef
 	if invalid == nil {
-		invalid = checkImport(ctx, tx, plan)
+		artist, invalid = checkImport(ctx, tx, plan)
 	}
 	if invalid != nil {
 		e, ok := rejection(invalid)
@@ -216,7 +222,7 @@ func commitImport(ctx context.Context, tx *store.CatalogTx, c ImportCandidate, p
 		}
 		return finish(ctx, tx, c, jobs.Result{State: jobs.StateFailed, ErrorCode: e.Code, ErrorMessage: e.text()})
 	}
-	if err := writeImport(ctx, tx, plan); err != nil {
+	if err := insertAlbum(ctx, tx, plan, artist, &c.Fingerprint); err != nil {
 		return ImportOutcome{}, err
 	}
 	return finish(ctx, tx, c, jobs.Result{State: jobs.StateDone, AlbumID: plan.albumID, Warnings: c.Warnings})
@@ -248,16 +254,14 @@ func (e *Error) text() string {
 	return e.Message
 }
 
-// importPlan is a validated candidate, normalized and ready to insert. It
+// albumPlan is a validated candidate, normalized and ready to insert. It
 // is built once, outside the transaction, and only read inside it, so a
 // retried transaction sees the same plan.
-type importPlan struct {
+type albumPlan struct {
 	albumID     uuid.UUID
-	fingerprint string
 	blobs       []Blob
 	artist      string
 	album       albumFields
-	path        Path
 	cover       *string
 	tracks      []store.InsertTracksParams
 	attachments []store.InsertAttachmentsParams
@@ -275,24 +279,28 @@ const (
 	roleLyrics
 )
 
-// checkImport runs, under the lock and before any write, the checks that
-// need the database: the blobs already recorded, the artist, the folder and
-// the path reservation. A domain rejection is a *Error (see rejection);
-// anything else is a database failure.
-func checkImport(ctx context.Context, tx *store.CatalogTx, plan *importPlan) error {
+// checkImport checks the blobs and resolves the import's artist by name
+// before checking the folder and path. It writes nothing, so a domain
+// rejection can be recorded in the same transaction.
+func checkImport(ctx context.Context, tx *store.CatalogTx, plan *albumPlan) (artistRef, error) {
 	if err := checkBlobs(ctx, tx, plan); err != nil {
-		return err
+		return artistRef{}, err
 	}
 	artist, err := resolveArtist(ctx, tx, plan.artist)
 	if err != nil {
-		return err
+		return artistRef{}, err
 	}
+	return artist, checkAlbumPath(ctx, tx, plan, artist, AlbumPath(plan.artist, plan.album.Title))
+}
+
+// checkAlbumPath checks the album folder and path under the catalog lock.
+func checkAlbumPath(ctx context.Context, tx *store.CatalogTx, plan *albumPlan, artist artistRef, output Path) error {
 	if artist.Exists {
 		if err := checkFolderFree(ctx, tx, artist.ID, plan.album.FolderKey, plan.albumID); err != nil {
 			return err
 		}
 	}
-	return checkAvailable(ctx, tx, plan.albumID, []Path{plan.path})
+	return checkAvailable(ctx, tx, plan.albumID, []Path{output})
 }
 
 // checkBlobs compares the candidate's blobs with the rows already in
@@ -300,7 +308,7 @@ func checkImport(ctx context.Context, tx *store.CatalogTx, plan *importPlan) err
 // (CodeBlobMismatch); a format known on both sides must agree
 // (CodeInvalidBlobFormat). A format known on one side only is the
 // content's format, and each blob's roles are checked against it.
-func checkBlobs(ctx context.Context, tx *store.CatalogTx, plan *importPlan) error {
+func checkBlobs(ctx context.Context, tx *store.CatalogTx, plan *albumPlan) error {
 	rows, err := tx.GetBlobs(ctx, blobHashes(plan.blobs))
 	if err != nil {
 		return dbErr("reading blobs", err)
@@ -331,15 +339,10 @@ func checkBlobs(ctx context.Context, tx *store.CatalogTx, plan *importPlan) erro
 	return nil
 }
 
-// writeImport writes the validated and checked candidate: blobs, artist,
-// album, tracks, attachments, then the claims and the render (§7.6 steps
-// 2-4).
-func writeImport(ctx context.Context, tx *store.CatalogTx, plan *importPlan) error {
+// insertAlbum writes the checked candidate with its resolved artist, then
+// reserves the output path and enqueues a render in the same transaction.
+func insertAlbum(ctx context.Context, tx *store.CatalogTx, plan *albumPlan, artist artistRef, fingerprint *string) error {
 	if err := registerBlobs(ctx, tx, plan.blobs); err != nil {
-		return err
-	}
-	artist, err := resolveArtist(ctx, tx, plan.artist)
-	if err != nil {
 		return err
 	}
 	if !artist.Exists {
@@ -347,10 +350,10 @@ func writeImport(ctx context.Context, tx *store.CatalogTx, plan *importPlan) err
 			return dbErr("creating artist "+artist.Name, err)
 		}
 	}
-	err = tx.InsertAlbum(ctx, store.InsertAlbumParams{
+	err := tx.InsertAlbum(ctx, store.InsertAlbumParams{
 		ID: plan.albumID, ArtistID: artist.ID, Title: plan.album.Title, FolderKey: plan.album.FolderKey,
 		Year: plan.album.Year, Genre: plan.album.Genre, Compilation: plan.album.Compilation,
-		CoverHash: plan.cover, ImportFingerprint: &plan.fingerprint,
+		CoverHash: plan.cover, ImportFingerprint: fingerprint,
 	})
 	if err != nil {
 		return dbErr("creating the album", err)
@@ -448,13 +451,31 @@ func checkRole(hash, format string, role blobRole) error {
 	return nil
 }
 
-// validateCandidate checks everything that needs no database. The error is
-// always a *Error: a domain rejection that fails the job.
-func validateCandidate(c ImportCandidate, coverFits CoverFits) (*importPlan, error) {
+// validateImport preserves the rejection order: fingerprint, album metadata,
+// job warnings, then the referenced content.
+func validateImport(c ImportCandidate, coverFits CoverFits) (*albumPlan, error) {
 	if !sha256Pattern.MatchString(c.Fingerprint) {
 		return nil, errorf(CodeInvalidFingerprint, "the fingerprint %q is not a SHA-256", c.Fingerprint)
 	}
-	plan := &importPlan{albumID: store.NewID(), fingerprint: c.Fingerprint, roles: map[string]blobRole{}}
+	album := AlbumCandidate{
+		Blobs: c.Blobs, Artist: c.Artist, Title: c.Title, Year: c.Year, Genre: c.Genre, Compilation: c.Compilation,
+		CoverHash: c.CoverHash, Tracks: c.Tracks, Attachments: c.Attachments,
+	}
+	plan, err := planAlbumMetadata(album, store.NewID())
+	if err != nil {
+		return nil, err
+	}
+	if _, err := jobs.EncodeWarnings(c.Warnings); err != nil {
+		return nil, &Error{Code: CodeInvalidImportWarnings, Message: "the import warnings", Err: err}
+	}
+	if err := planAlbumContent(album, plan, coverFits); err != nil {
+		return nil, err
+	}
+	return plan, nil
+}
+
+func planAlbumMetadata(c AlbumCandidate, id uuid.UUID) (*albumPlan, error) {
+	plan := &albumPlan{albumID: id, roles: map[string]blobRole{}}
 	var err error
 	if plan.artist, err = names.NormalizeRequiredText(c.Artist); err != nil {
 		return nil, textError("album artist", err)
@@ -462,13 +483,13 @@ func validateCandidate(c ImportCandidate, coverFits CoverFits) (*importPlan, err
 	if plan.album, err = normalizeAlbum(c.Title, c.Year, c.Genre, c.Compilation); err != nil {
 		return nil, err
 	}
-	plan.path = AlbumPath(plan.artist, plan.album.Title)
-	if _, err := jobs.EncodeWarnings(c.Warnings); err != nil {
-		return nil, &Error{Code: CodeInvalidImportWarnings, Message: "the import warnings", Err: err}
-	}
+	return plan, nil
+}
+
+func planAlbumContent(c AlbumCandidate, plan *albumPlan, coverFits CoverFits) error {
 	blobs, err := indexBlobs(c.Blobs)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	use := func(hash string, role blobRole) error {
 		b, ok := blobs[hash]
@@ -480,29 +501,29 @@ func validateCandidate(c ImportCandidate, coverFits CoverFits) (*importPlan, err
 	}
 	if c.CoverHash != nil {
 		if err := use(*c.CoverHash, roleCover); err != nil {
-			return nil, err
+			return err
 		}
 		if size := blobs[*c.CoverHash].Size; size > MaxCoverBytes {
-			return nil, errorf(CodeInvalidCover, "the cover takes %d bytes, the maximum is %d", size, MaxCoverBytes)
+			return errorf(CodeInvalidCover, "the cover takes %d bytes, the maximum is %d", size, MaxCoverBytes)
 		}
 		plan.cover = c.CoverHash
 	}
 	if err := validateFiles(c, plan, use); err != nil {
-		return nil, err
+		return err
 	}
 	if c.CoverHash != nil {
 		if err := checkCoverFits(blobs[*c.CoverHash], c.Tracks, blobs, coverFits); err != nil {
-			return nil, err
+			return err
 		}
 	}
 	for _, b := range c.Blobs {
 		if plan.roles[b.Hash] == 0 {
-			return nil, errorf(CodeInvalidBlob, "blob %s is listed but not used", b.Hash)
+			return errorf(CodeInvalidBlob, "blob %s is listed but not used", b.Hash)
 		}
 	}
 	plan.blobs = slices.Clone(c.Blobs)
 	slices.SortFunc(plan.blobs, func(a, b Blob) int { return strings.Compare(a.Hash, b.Hash) })
-	return plan, nil
+	return nil
 }
 
 // checkCoverFits asks coverFits (N-091) whether the cover can be embedded
@@ -551,7 +572,7 @@ func indexBlobs(list []Blob) (map[string]Blob, error) {
 // the limits of §7.2, the ranges and texts of the tracks, unique source
 // paths, the LRC association of §7.4, and attachment paths that stay
 // distinct after normalization, file/directory collisions included (§5.2).
-func validateFiles(c ImportCandidate, plan *importPlan, use func(string, blobRole) error) error {
+func validateFiles(c AlbumCandidate, plan *albumPlan, use func(string, blobRole) error) error {
 	if len(c.Tracks) == 0 {
 		return errorf(CodeNoTracks, "an album needs at least one track")
 	}

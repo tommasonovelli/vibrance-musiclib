@@ -7,6 +7,9 @@
 *.out
 coverage.html
 
+# Local maintenance coordination
+/.musiclib-command.lock/
+
 # Local environment
 .env
 

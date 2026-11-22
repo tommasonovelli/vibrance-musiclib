@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 
 	"musiclib/internal/blobstore"
+	"musiclib/internal/catalog"
 	"musiclib/internal/fsops"
 	"musiclib/internal/importer"
 	"musiclib/internal/jobs"
@@ -209,6 +210,90 @@ func TestExecuteRenderTwoWorkersArtistRename(t *testing.T) {
 	if n := m.count(`SELECT count(*) FROM jobs WHERE kind = 'render'`); n != 0 {
 		t.Fatalf("%d render jobs left", n)
 	}
+}
+
+func TestExecuteRenderTrackLineage(t *testing.T) {
+	m := newMediaEnv(t)
+	ctx := t.Context()
+	writeAlbum(t, m.src, "source", "Artist", "Source", 1)
+	writeAlbum(t, m.src, "dest", "Artist", "Destination", 1)
+	m.importAll()
+	m.runPool(2)
+	src, dst := m.albumID("Source"), m.albumID("Destination")
+	type track struct {
+		id   uuid.UUID
+		blob catalog.Blob
+	}
+	readTrack := func(album uuid.UUID) (tr track) {
+		t.Helper()
+		if err := m.db.QueryRow(ctx, `SELECT t.id, t.blob_hash, b.size, b.format FROM tracks t JOIN blobs b ON b.hash=t.blob_hash WHERE t.album_id=$1`, album).
+			Scan(&tr.id, &tr.blob.Hash, &tr.blob.Size, &tr.blob.Format); err != nil {
+			t.Fatal(err)
+		}
+		return tr
+	}
+	check := func(album uuid.UUID, want ...track) render.Receipt {
+		t.Helper()
+		res := m.publishedResult(album)
+		m.wantPublished(album, res)
+		dir := "library/" + res.Dir + "/"
+		b, err := os.ReadFile(m.path(dir + render.ReceiptName))
+		if err != nil {
+			t.Fatal(err)
+		}
+		r, err := render.ParseReceipt(b)
+		if err != nil || r.SchemaVersion != render.ReceiptSchemaVersion || r.StoreID != m.p.storeID || len(r.Files) != len(want) {
+			t.Fatalf("receipt identity: %+v %v", r, err)
+		}
+		for i, f := range r.Files {
+			b, err := os.ReadFile(m.path(dir + f.RelativePath))
+			if err != nil || int64(len(b)) != f.Size || sha(b) != f.SHA256 || f.SHA256 == f.SourceBlobSHA256 ||
+				f.TrackID != want[i].id || f.SourceBlobSHA256 != want[i].blob.Hash {
+				t.Fatalf("file %d: %+v, want track %+v and actual output hash, read: %v", i, f, want[i], err)
+			}
+		}
+		return r
+	}
+	moved, existing := readTrack(src), readTrack(dst)
+	first := check(src, moved)
+	check(dst, existing)
+	if err := m.retitle(src, "Renamed Source"); err != nil {
+		t.Fatal(err)
+	}
+	m.runPool(2)
+	renamed := check(src, moved)
+	if renamed.Files[0].SHA256 == first.Files[0].SHA256 {
+		t.Fatal("renaming did not retag the published audio")
+	}
+	if _, _, err := m.cat.RequestRender(ctx, src, m.album(src).Revision); err != nil {
+		t.Fatal(err)
+	}
+	m.runPool(2)
+	rerendered := check(src, moved)
+	if rerendered.BuildID == renamed.BuildID || rerendered.Files[0] != renamed.Files[0] {
+		t.Fatal("rerender must make a new build with identical file inventory")
+	}
+	if _, err := m.cat.MoveTracks(ctx, src, m.album(src).Revision, []uuid.UUID{moved.id}, dst); err != nil {
+		t.Fatal(err)
+	}
+	m.runPool(2)
+	check(dst, existing, moved)
+	if !m.publishedResult(src).Removal {
+		t.Fatal("source still published after move")
+	}
+	if _, _, err := m.cat.DeleteTrack(ctx, dst, m.album(dst).Revision, moved.id); err != nil {
+		t.Fatal(err)
+	}
+	m.runPool(2)
+	check(dst, existing)
+	_, newID, err := m.cat.AddTrack(ctx, dst, m.album(dst).Revision, catalog.NewTrack{
+		Blob: moved.blob, SourcePath: "recreated.flac", Title: "Recreated", Disc: 1, No: 2,
+	})
+	if err != nil || newID == moved.id {
+		t.Fatalf("recreate track: %s %v", newID, err)
+	}
+	m.runPool(2)
+	check(dst, existing, track{id: newID, blob: moved.blob})
 }
 
 // A failure before the journal with a real build: the job fails with the

@@ -125,8 +125,8 @@ func TestListAlbumsAPI(t *testing.T) {
 	e.wantError(req{method: "GET", path: "/api/albums?q=%01"}, nethttp.StatusUnprocessableEntity, names.CodeTextControlChar)
 	e.wantError(req{method: "GET", path: "/api/albums?q=a%00b"}, nethttp.StatusUnprocessableEntity, names.CodeTextControlChar)
 	e.wantError(req{method: "GET", path: "/api/albums?q=%FF"}, nethttp.StatusUnprocessableEntity, names.CodeInvalidUTF8)
-	r = e.wantError(req{method: "POST", path: "/api/albums", body: `{}`}, nethttp.StatusMethodNotAllowed, CodeMethodNotAllowed)
-	if r.header.Get("Allow") != "GET, HEAD" {
+	r = e.wantError(req{method: "PUT", path: "/api/albums", body: `{}`}, nethttp.StatusMethodNotAllowed, CodeMethodNotAllowed)
+	if r.header.Get("Allow") != "GET, HEAD, POST" {
 		t.Fatalf("Allow %q", r.header.Get("Allow"))
 	}
 }

@@ -2,7 +2,7 @@
 # Shared helpers for the host-side scripts. Source it; do not execute it.
 #
 # Sets:  REPO_ROOT, and exports MUSICLIB_DEV_UID / MUSICLIB_DEV_GID for Compose.
-# Defines: die, info, compose_dev, compose_app, run_sqlc, start_test_db.
+# Defines: die, info, compose_dev, run_sqlc, start_test_db.
 
 die() {
   printf '%s: error: %s\n' "${0##*/}" "$*" >&2
@@ -52,15 +52,6 @@ export MUSICLIB_DEV_UID MUSICLIB_DEV_GID="${MUSICLIB_DEV_GID:-${MUSICLIB_DEV_UID
 # whatever COMPOSE_FILE says.
 compose_dev() {
   docker compose --project-directory "${REPO_ROOT}" -f "${REPO_ROOT}/compose.dev.yaml" "$@"
-}
-
-# docker compose for the installation's `app` (the maintenance scripts), run
-# from the repository root without -f: Compose then uses COMPOSE_FILE, from
-# the environment or from .env, and compose.yaml (production, the published
-# image) when it is unset. A source build sets COMPOSE_FILE=compose.dev.yaml,
-# so the offline command runs the same image as the server (docs/operations.md).
-compose_app() {
-  (cd -- "${REPO_ROOT}" && docker compose "$@")
 }
 
 # sqlc (DESIGN.md §2.1), pinned like every other image; see docs/docker.md.

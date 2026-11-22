@@ -52,6 +52,10 @@ func (r Report) HasErrors() bool {
 // caller acquired the flock and verified the store identity before calling.
 func Doctor(ctx context.Context, db *pgxpool.Pool, v *volume.Volume, deep bool) (Report, error) {
 	var r Report
+	storeID := v.StoreID()
+	if storeID == uuid.Nil {
+		return r, fmt.Errorf("doctor requires an identified store")
+	}
 	q := store.New(db)
 	issues, err := q.DoctorStructuralIssues(ctx)
 	if err != nil {
@@ -152,11 +156,15 @@ func Doctor(ctx context.Context, db *pgxpool.Pool, v *volume.Volume, deep bool) 
 			r.add("error", "doctor_receipt_unreadable", entity, "Restore the output by rendering or rebuilding: "+err.Error())
 			continue
 		}
+		rec, err := render.ParseReceipt(data)
+		if err == nil && rec.ForeignStore(storeID) {
+			r.add("error", "doctor_foreign_output", entity, "The receipt names a different store; inspect and move the foreign output before rendering.")
+			continue
+		}
 		if render.ReceiptHash(data) != *a.PublishedReceiptHash {
 			r.add("error", "doctor_receipt_hash", entity, "The receipt differs from the DB hash; render or rebuild the output.")
 			continue
 		}
-		rec, err := render.ParseReceipt(data)
 		if err != nil || rec.AlbumID != a.ID || rec.BuildID != *a.PublishedBuild || rec.AlbumRevision != a.PublishedRevision || (a.PublishedRenderer != nil && rec.RenderVersion != *a.PublishedRenderer) {
 			r.add("error", "doctor_receipt_invalid", entity, "The receipt does not match the published album; render or rebuild the output.")
 			continue
@@ -285,7 +293,7 @@ func readReceipt(root *fsops.Root, rel string) (data []byte, err error) {
 	if err != nil {
 		return nil, err
 	}
-	if fi.Type != fsops.TypeRegular || fi.Size > render.MaxReceiptBytes {
+	if fi.Type != fsops.TypeRegular || fi.Size > int64(render.MaxReceiptBytes) {
 		return nil, fmt.Errorf("not a bounded regular receipt")
 	}
 	f, err := root.Open(rel)
@@ -293,7 +301,7 @@ func readReceipt(root *fsops.Root, rel string) (data []byte, err error) {
 		return nil, err
 	}
 	defer func() { err = errors.Join(err, f.Close()) }()
-	return io.ReadAll(io.LimitReader(f, render.MaxReceiptBytes+1))
+	return io.ReadAll(io.LimitReader(f, int64(render.MaxReceiptBytes)+1))
 }
 
 func hashFile(ctx context.Context, root *fsops.Root, rel string) (sum string, size int64, err error) {

@@ -35,6 +35,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"musiclib/internal/failpoint"
@@ -51,7 +52,8 @@ var shutdownGrace = 30 * time.Second
 
 // Config are the publisher's dependencies, passed explicitly (§2.3).
 type Config struct {
-	DB *pgxpool.Pool
+	DB      *pgxpool.Pool
+	StoreID uuid.UUID // Identity of the already-paired data volume.
 	// Library and Work are /data/library and /data/work: two fsops roots on
 	// the same filesystem and mount, as the boot checked (§3.1).
 	Library *fsops.Root
@@ -75,6 +77,7 @@ type Config struct {
 // by the pool's workers: every publication runs under publishMu.
 type Publisher struct {
 	db            *pgxpool.Pool
+	storeID       uuid.UUID
 	library, work *fsops.Root
 	builder       *render.Builder
 	log           *slog.Logger
@@ -91,14 +94,14 @@ type Publisher struct {
 
 // New returns the publisher and creates work/retired durably if missing.
 func New(cfg Config) (*Publisher, error) {
-	if cfg.DB == nil || cfg.Library == nil || cfg.Work == nil || cfg.Builder == nil || cfg.Log == nil {
-		return nil, errorf(CodeInvalidArgument, "the publisher needs the database, library, work, the builder and a logger")
+	if cfg.DB == nil || cfg.StoreID == uuid.Nil || cfg.Library == nil || cfg.Work == nil || cfg.Builder == nil || cfg.Log == nil {
+		return nil, errorf(CodeInvalidArgument, "the publisher needs the database, store identity, library, work, the builder and a logger")
 	}
 	if err := cfg.Work.MkdirAllSync(retiredDir, dirPerm); err != nil {
 		return nil, err
 	}
 	return &Publisher{
-		db: cfg.DB, library: cfg.Library, work: cfg.Work, builder: cfg.Builder, log: cfg.Log,
+		db: cfg.DB, storeID: cfg.StoreID, library: cfg.Library, work: cfg.Work, builder: cfg.Builder, log: cfg.Log,
 		renderVersion: render.Version, mu: make(chan struct{}, 1), failpoints: cfg.Failpoints,
 	}, nil
 }
@@ -153,7 +156,7 @@ func (p *Publisher) Publish(ctx context.Context, snap *jobs.RenderSnapshot, res 
 		// §9.3 A: the build is discarded, outside the mutex (§2.2: no
 		// recursive removal in the critical section). If the process is
 		// stopping, the boot removes it (§11.1 step 5).
-		if derr := p.builder.Discard(ctx, j.BuildID); derr != nil {
+		if derr := p.removeWork(ctx, buildDir(j.BuildID), j.staging()); derr != nil {
 			p.log.Warn("discarding a build that was not published", "album_id", j.AlbumID, "build_id", j.BuildID,
 				"error", derr.Error())
 		}
@@ -170,6 +173,9 @@ func (p *Publisher) publishLocked(ctx context.Context, snap *jobs.RenderSnapshot
 	rep := Report{Journal: j}
 	if p.suspended != nil {
 		return rep, false, jobs.Stop(wrap(CodeSuspended, p.suspended, "publishing is suspended in this process"))
+	}
+	if snap.StoreID != p.storeID {
+		return rep, true, errorf(CodeForeignOutput, "%s: the snapshot belongs to a different store", j)
 	}
 	if err := p.preflight(j); err != nil {
 		return rep, true, err

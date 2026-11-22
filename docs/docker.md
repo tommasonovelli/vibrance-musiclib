@@ -36,8 +36,9 @@ Everything is built, tested and run in Docker. The host needs only **Docker Engi
 | `scripts/sqlc.sh` | regenerates `internal/store` from `sql/` and `migrations/` |
 | `scripts/fuzz.sh` | one fuzz target on the live sources |
 | `scripts/lint-shell.sh` | shellcheck on every shell script |
+| `scripts/test-musiclib.sh` | standalone maintenance lifecycle tests with a fake Docker executable |
 | `scripts/lib/common.sh` | shared helpers of the scripts (sourced, never run) |
-| `scripts/doctor.sh`, `rebuild.sh`, `backup.sh`, `restore.sh` | the maintenance wrappers for an installation: see [The maintenance scripts](operations.md#the-maintenance-scripts) (`scripts/lib/maintenance.sh` is their shared part) |
+| `musiclib` | standalone [maintenance command](operations.md#maintenance); the four older scripts in `scripts/` delegate to it |
 | `docker/gate.sh` | in-container: build, vet, gofmt, `go test -race` |
 | `docker/with-testdata.sh` | in-container: puts `TMPDIR` on the ext4 test volume, refuses other filesystems |
 | `.github/workflows/release.yml` | on a tag `vX.Y.Z`: gate, image push to GHCR, GitHub Release ([Releasing](#releasing)) |
@@ -143,7 +144,7 @@ scripts/fuzz.sh FuzzCheckJSON 1000x ./internal/http
 scripts/lint-shell.sh
 ```
 
-Runs the pinned shellcheck image, without network, on every `*.sh` file under `scripts/` and `docker/`, `scripts/lib/` included. Run it after changing any shell script. It prints `shellcheck N files`, then either shellcheck's findings (exit not 0) or `clean` (exit 0). It takes no argument.
+Runs the pinned shellcheck image, without network, on `musiclib` and every `*.sh` file under `scripts/` and `docker/`, `scripts/lib/` included. Run it after changing any shell script. It prints `shellcheck N files`, then either shellcheck's findings (exit not 0) or `clean` (exit 0). It takes no argument.
 
 ### docker/gate.sh and docker/with-testdata.sh
 
@@ -169,8 +170,8 @@ To run MusicLib built from your checkout, follow [Running from source](operation
 docker compose -f compose.dev.yaml up -d --build --wait     # returns when the app is healthy
 ```
 
-- With `COMPOSE_FILE` in `.env`, plain `docker compose` commands and the maintenance scripts (`scripts/doctor.sh`, `backup.sh`, `rebuild.sh`, `restore.sh`) act on the source build; without it they act on `compose.yaml` and its published image. The development scripts ignore `COMPOSE_FILE`: `check.sh`, `dev.sh` and `fuzz.sh` always use `compose.dev.yaml`.
-- The maintenance scripts act only on containers created in the clone's folder. Before stopping anything they compare the folder that Docker records in the project's `app` and `postgres` containers (label `com.docker.compose.project.working_dir`) with the checkout, as the same directory (`-ef`, so `C:\…` and `/c/…` forms in Git Bash, symlinks and trailing slashes compare correctly). A container created elsewhere (a second checkout or worktree that ran `docker compose up` under the same project name, or an installation in `~/vibrance`) makes them refuse with the commands to run by hand. Create the app and database of a source build from the checkout's root, as above.
+- With `COMPOSE_FILE` in `.env`, plain `docker compose` and `./musiclib` act on the source build; without it they act on `compose.yaml` and its published image. The development scripts ignore `COMPOSE_FILE`: `check.sh`, `dev.sh` and `fuzz.sh` always use `compose.dev.yaml`.
+- Create the source app and database from the checkout's root. `musiclib` verifies that both containers were created there, and checks their configuration, image IDs and resolved mounts before touching them. The preflight reads Compose's resolved JSON with Perl's `JSON::PP` in a short-lived, networkless container from the pinned PostgreSQL image. A private tmpfs replaces the image's declared data volume; no installation storage is mounted. Service hashes omit top-level resources: for the supported plain local volumes and default bridge, the command also checks resolved names, actual Docker resource metadata, ownership labels and any nonempty resource hashes. Older Compose releases did not stamp resource hashes; an absent hash is not drift if the other checks pass. It refuses incompatible metadata rather than allowing Compose to reconcile a changed resource during maintenance.
 - The app is built as the image `musiclib-app:local`, version `devel`. The tag is fixed: a second clone that builds from source retags the first clone's image.
 - `import` must exist (`mkdir -p import`, or set `MUSICLIB_IMPORT`): Compose does not create it.
 
@@ -358,7 +359,7 @@ Rules:
 
 1. **guard**: the tag is `vMAJOR.MINOR.PATCH` (no leading zeros, no suffix), it still names the pushed commit, and that commit is on `main`. The `app` image of `compose.yaml` is exactly `ghcr.io/<owner>/musiclib:X.Y.Z`, `.env.example` exists, and `CHANGELOG.md` has exactly one non-empty `## [X.Y.Z]` section.
 2. **publish**: first the gate, `scripts/check.sh` unchanged, with the Dockerfile's default uid 10001 and `GATE_TEST_TIMEOUT=20m`, in a Buildx builder with the pinned BuildKit. Then it logs in to GHCR, refuses if `ghcr.io/<owner>/musiclib:X.Y.Z` already exists, and builds the `runtime` target in the same builder (reusing the FFmpeg, TagLib and toolchain layers of the gate) with `MUSICLIB_VERSION=X.Y.Z`, `MUSICLIB_REVISION` (the commit) and `MUSICLIB_SOURCE` (the repository URL). It pushes `:X.Y.Z`, plus `:X.Y` and `:X` when this release is the newest of its series, and `:latest` when it is the newest of all (by `sort -V` of the `vX.Y.Z` tags, fetched by this job): a patch of an older series, or a re-run of an older release, never moves them back. `compose.yaml` keeps the explicit version. The image carries an SBOM and a `mode=max` provenance attestation.
-3. **release**: pulls the image by digest, and checks that `version` prints `version: X.Y.Z` and that the revision label is the commit. It then creates the GitHub Release «Vibrance MusicLib X.Y.Z». The release body is the `CHANGELOG.md` section, followed by the image with its digest and an install snippet. Its assets are `compose.yaml` and `env.example` (the repository's `.env.example`: GitHub renames asset names that start with a dot), `THIRD_PARTY_NOTICES.md`, and the FFmpeg and TagLib source tarballs built into the image, downloaded again and checked against the versions and sha256 of the `Dockerfile`'s ARGs. The release is marked **Latest** on GitHub with the same rule as `:latest`, checked again on the tags this job fetched: only when it is the newest version (`--latest=false` otherwise).
+3. **release**: pulls the image by digest, and checks that `version` prints `version: X.Y.Z` and that the revision label is the commit. It then creates the GitHub Release «Vibrance MusicLib X.Y.Z». The release body is the `CHANGELOG.md` section, followed by the image with its digest and an install snippet. Its assets are `compose.yaml`, `musiclib` and `env.example` (the repository's `.env.example`: GitHub renames asset names that start with a dot), `THIRD_PARTY_NOTICES.md`, and the FFmpeg and TagLib source tarballs built into the image, downloaded again and checked against the versions and sha256 of the `Dockerfile`'s ARGs. The release is marked **Latest** on GitHub with the same rule as `:latest`, checked again on the tags this job fetched: only when it is the newest version (`--latest=false` otherwise).
 
 Release one version at a time. All runs share one concurrency group, so a run waits for the one before it and the floating tags and the Latest release only move forward. GitHub keeps only one *pending* run per group: pushing a third tag while one run is in progress and another is waiting cancels the waiting one. That is safe, nothing of it was published: when the others have finished, open the cancelled run and use **Re-run all jobs**.
 
@@ -370,17 +371,32 @@ A release requires a passing run on a **native** Ubuntu 24.04+ Docker Engine wit
 findmnt -T /var/lib/docker -no FSTYPE      # must report ext4
 findmnt -T /srv/musiclib/data -no FSTYPE   # must report ext4
 scripts/lint-shell.sh
+scripts/test-musiclib.sh
 docker compose -f compose.dev.yaml build app
 docker compose -f compose.dev.yaml run --rm --no-deps --entrypoint /usr/lib/postgresql/17/bin/pg_dump app --version
 docker compose -f compose.dev.yaml run --rm --no-deps --entrypoint /usr/lib/postgresql/17/bin/pg_restore app --version
 # Both clients must report PostgreSQL 17.11.
 scripts/check.sh
 scripts/dev.sh go test -race -count=2 ./internal/maintenance ./internal/volume ./internal/catalog ./cmd/musiclibd
+scripts/dev.sh go test -race -count=20 ./internal/catalog
+scripts/dev.sh go test -race -count=20 -run 'TestAlbumCreation(ConcurrentSameID|ArtistRace|SlotBudgetAndCancellation|UncertainCommit)$' ./internal/http
+scripts/dev.sh go test -race -count=20 -run 'TestRecover(LegacyV1Exchange|MixedReceiptExchange|ForeignStore)$|TestPublish(LockOrder|ChangeBetweenPrepareAndFinalize)$' ./internal/publish
 scripts/dev.sh go test -race -count=3 -run 'TestRebuildRealCrashWindows|TestRestoreRealCrashWindows|TestBackupRealCrashWindows' ./internal/maintenance
-scripts/dev.sh go test -race -run 'TestBackupLossRestoreBootAndDoctor|TestReleaseCollectionInterruptedAndRestored' ./cmd/musiclibd
+scripts/dev.sh go test -race -run 'TestBackupLossRestoreBootAndDoctor|TestReleaseCollectionInterruptedAndRestored|TestRestoreReceiptLineageAcrossDivergingCopies' ./cmd/musiclibd
 ```
 
-Record the machine and kernel, the commands, their output and any skipped tests. Do not release until the native gate and the acceptance tests above (a test collection imported, edited, interrupted and restored without manual fixes) pass.
+Record the machine and kernel, the ext4 mounts, PostgreSQL client versions, the commands, their output and any skipped tests. Record the uncompressed frontend size with `wc -c web/*.css web/*.js` (no fixed ceiling). For changes to creation or receipts, mutation-check that tests fail when creation conflict checks or the atomic enqueue are bypassed, the source hash replaces the published hash, or legacy receipt recognition is disabled. Do this in a disposable test checkout, never in the release tree or on installation data.
+
+#### 1.2.0 upgrade, restore and recovery rehearsal
+
+Repeat on the native host in disposable, isolated Compose projects. Give each project its own database, data, backup and import storage and loopback port. Never use a real installation. Record the actual published 1.2.0 image digest and revision and the candidate's exact source revision and image digest or local image ID. Use the [operator upgrade](operations.md#upgrading-the-published-image) and [restore](operations.md#restore-use-new-empty-destinations) procedures for lifecycle and space planning, using the local candidate in place of a not-yet-published release.
+
+1. In 1.2.0, create a test catalog with published v1 receipts and at least one deliberately unreferenced original. Take a [manual pre-upgrade backup](operations.md#manual-backup-and-restore); record catalog IDs, original hashes and receipt hashes. Verify the backup before using it.
+2. Upgrade the app in place, keeping the same database and data mounts. No reimport, catalog rewrite or receipt edit. Separately restore a copy of that backup into a fresh candidate project with `./musiclib restore NAME`. Verify that only PostgreSQL starts before the offline restore succeeds. Restore the same backup into a second fresh candidate project and verify that it has the same lineage, not a new store ID.
+3. In a separate sandbox, get a genuine pending publication from the released app by interrupting a render after the exchange and before finalization. Record the journal row, the installed v1 receipt's build ID and hash, and the old build on disk. A kill that leaves an empty journal does not count. Do not fabricate the journal or change catalog rows by hand for this drill. Boot the candidate and verify it completes that exact publication before queueing the v2 render, without reversing the exchange. Keep legacy and mixed-receipt fixture coverage separate from what this real-image drill proves.
+4. Budget and record time and free space for complete rerenders. Once rendering finishes, verify that jobs and journals drained, store/album/track IDs and every original (including the unreferenced one) are unchanged, and the backup used for restore is unchanged. Check each v2 track's ID and source hash against the catalog, and independently hash the published files. Run `./musiclib doctor --deep` on each outcome; unreferenced originals are informational, not damage.
+
+A Docker Desktop rehearsal with the published 1.2.0 image and a local candidate covered in-place upgrade, fresh restore and the post-exchange/pre-finalize v1 window. It is not native release evidence, a rehearsal of all crash windows, or verification of a published candidate artifact. Do not release until the native gate and acceptance checks pass.
 
 ### Publishing a release
 
@@ -409,18 +425,25 @@ The `CHANGELOG.md` section of a version is its heading, `## [X.Y.Z]`, optionally
 
 - In **guard**, or in **publish** before its push (the gate included): nothing is published. Fix the problem on `main`, move the tag to the new commit (`git tag -d vX.Y.Z`, `git push origin :refs/tags/vX.Y.Z`, tag and push again).
 - In **release**, the image is already published. Use **Re-run failed jobs**: the release job runs again on the same digest, and decides **Latest** again from the tags it fetches then. A job that pushed is never re-run to push again: the version check refuses it. If the image itself is wrong, do not publish it under the same version. Release a new patch version instead.
-- In **publish** after the push succeeded: a re-run is refused by the version check, so check the image (below) and create the release by hand, with the `CHANGELOG.md` section in `notes.md` followed by the line ``- Digest: `sha256:…` `` (from `imagetools inspect`), `cp .env.example env.example`, and the FFmpeg and TagLib tarballs downloaded and checked as the workflow's step "Add the third-party notices and sources" does: `gh release create vX.Y.Z --verify-tag --title "Vibrance MusicLib X.Y.Z" --notes-file notes.md compose.yaml env.example THIRD_PARTY_NOTICES.md ffmpeg-*.tar.gz taglib-*.tar.gz` (add `--latest=false` if it is not the newest version). If the push stopped after `:X.Y.Z`, move each floating tag it should have moved by hand, only when this is the newest version of that series (`:latest`: of all), e.g. `docker buildx imagetools create -t ghcr.io/tommasonovelli/musiclib:latest ghcr.io/tommasonovelli/musiclib:X.Y.Z`. Or release a new patch version.
+- In **publish** after the push succeeded: a re-run is refused by the version check, so check the image (below) and create the release by hand, with the `CHANGELOG.md` section in `notes.md` followed by the line ``- Digest: `sha256:…` `` (from `imagetools inspect`), the same tag's `compose.yaml` and executable `musiclib` (`chmod +x musiclib`), `cp .env.example env.example`, and the FFmpeg and TagLib tarballs downloaded and checked as the workflow's step "Add the third-party notices and sources" does: `gh release create vX.Y.Z --verify-tag --title "Vibrance MusicLib X.Y.Z" --notes-file notes.md compose.yaml musiclib env.example THIRD_PARTY_NOTICES.md ffmpeg-*.tar.gz taglib-*.tar.gz` (add `--latest=false` if it is not the newest version). If the push stopped after `:X.Y.Z`, move each floating tag it should have moved by hand, only when this is the newest version of that series (`:latest`: of all), e.g. `docker buildx imagetools create -t ghcr.io/tommasonovelli/musiclib:latest ghcr.io/tommasonovelli/musiclib:X.Y.Z`. Or release a new patch version.
+
+  For a manually created release, include a link in `notes.md` to `https://github.com/tommasonovelli/vibrance-musiclib/blob/vX.Y.Z/docs/operations.md#prepare-the-release-files-do-not-start-yet` with `vX.Y.Z` replaced by the exact tag. Tell users to set `tag` in that block to the same release tag and to follow the separate first-start or restore instructions. Do not point to the moving branch or tell restore users to run the startup block.
 
 ### Checking a published release
 
-The digest must be the one in the release notes:
+Verify the tag resolves to the digest in the release notes. Inspect the SBOM and provenance and check the runtime version and revision using that digest, not a floating tag:
 
 ```sh
-docker buildx imagetools inspect ghcr.io/tommasonovelli/musiclib:X.Y.Z
-docker buildx imagetools inspect ghcr.io/tommasonovelli/musiclib:X.Y.Z --format '{{ json .SBOM }}'
-docker buildx imagetools inspect ghcr.io/tommasonovelli/musiclib:X.Y.Z --format '{{ json .Provenance }}'
-docker run --rm ghcr.io/tommasonovelli/musiclib:X.Y.Z version
+tagged=ghcr.io/tommasonovelli/musiclib:X.Y.Z
+pinned=ghcr.io/tommasonovelli/musiclib@sha256:RELEASE_DIGEST
+docker buildx imagetools inspect "$tagged"
+docker buildx imagetools inspect "$pinned" --format '{{ json .SBOM }}'
+docker buildx imagetools inspect "$pinned" --format '{{ json .Provenance }}'
+docker run --rm --platform linux/amd64 --network none "$pinned" version
+docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$pinned"
 ```
+
+Substitute the released version and digest. Check that the attestations are present for the linux/amd64 image and that the provenance and revision label agree with the tagged source. Download the assets from that exact GitHub Release: check `compose.yaml` names the intended version, `env.example` matches the tagged `.env.example`, and the notices and source tarballs match the tagged notices and Dockerfile pins. Compare the standalone `musiclib` asset to the tagged script, set `chmod +x musiclib` after downloading, and check `./musiclib --help` without repository libraries. Verify the release notes point to that tag's guides and separate file preparation, first start and restore. A passing local build does not verify any published asset or attestation.
 
 ### Changing the workflow
 

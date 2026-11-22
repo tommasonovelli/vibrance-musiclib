@@ -137,11 +137,10 @@ func StagingDir(buildID uuid.UUID) string {
 
 func buildDir(buildID uuid.UUID) string { return workDir + "/" + buildID.String() }
 
-// Discard removes the directory of a build, whatever it holds: Build uses
-// it on every failure, the publisher after a superseded build or once the
-// old staging is no longer needed (§6.3, §9.3). A build that does not exist
-// (a removal, or one already discarded) is not an error. It never touches
-// library/ or originals/.
+// Discard removes the directory of a build, whatever it holds. Build uses
+// it on failure only if it created the directory. The publisher uses it
+// after a superseded build or once the old staging is no longer needed.
+// A missing directory is not an error. It never touches library/ or originals/.
 func (b *Builder) Discard(ctx context.Context, buildID uuid.UUID) error {
 	if buildID == uuid.Nil {
 		return errorf(CodeInvalidArgument, "no build id")
@@ -167,18 +166,21 @@ func (b *Builder) Discard(ctx context.Context, buildID uuid.UUID) error {
 //     bottom-up, the album directory, and its parents render/<build_id>,
 //     render and work (§9.1 step 8).
 //
-// On any failure, cancellation included, the build's directory is removed
-// (Discard) before Build returns, and nothing outside it was written:
-// library/ and originals/ are untouched (§9.1). Cancelling ctx kills the
-// running tool through the Runner (§8.5).
-func (b *Builder) Build(ctx context.Context, p Plan) (res Result, err error) {
+// On failure, cancellation included, Build discards only a directory it
+// created. It never writes to library/ or originals/. Cancelling ctx kills
+// the running tool through the Runner.
+func (b *Builder) Build(ctx context.Context, p Plan) (Result, error) {
+	return b.build(ctx, p, store.NewID)
+}
+
+func (b *Builder) build(ctx context.Context, p Plan, newID func() uuid.UUID) (res Result, err error) {
 	if p.RenderVersion != Version {
 		return Result{}, errorf(CodeVersionMismatch, "the plan is for render_version %q, this renderer is %q", p.RenderVersion, Version)
 	}
-	if p.AlbumID == uuid.Nil || p.AlbumRevision <= 0 {
-		return Result{}, errorf(CodeInvalidArgument, "the plan has no album or revision")
+	if p.StoreID == uuid.Nil || p.AlbumID == uuid.Nil || p.AlbumRevision <= 0 {
+		return Result{}, errorf(CodeInvalidArgument, "the plan has no store, album or revision")
 	}
-	res = Result{BuildID: store.NewID(), AlbumID: p.AlbumID, AlbumRevision: p.AlbumRevision,
+	res = Result{BuildID: newID(), AlbumID: p.AlbumID, AlbumRevision: p.AlbumRevision,
 		RenderVersion: p.RenderVersion, Removal: p.Removal}
 	if p.Removal {
 		return res, nil
@@ -190,15 +192,22 @@ func (b *Builder) Build(ctx context.Context, p Plan) (res Result, err error) {
 	if res.Space, err = b.reserveSpace(estimate(p)); err != nil {
 		return Result{}, err
 	}
+	var ownsBuildDir bool
 	defer func() {
 		if err != nil {
-			// The removal must run even when ctx is what ended the build.
-			err = errors.Join(err, b.Discard(context.WithoutCancel(ctx), res.BuildID))
+			if ownsBuildDir {
+				// Discard must run even when ctx is what ended the build.
+				err = errors.Join(err, b.Discard(context.WithoutCancel(ctx), res.BuildID))
+			}
 			res.Space.Release()
 			res = Result{}
 		}
 	}()
 	if err := b.failpoints.Hit("reserved"); err != nil {
+		return res, err
+	}
+	ownsBuildDir, err = b.createBuildDir(res.BuildID)
+	if err != nil {
 		return res, err
 	}
 	bd, err := b.stage(res.BuildID)
@@ -268,13 +277,19 @@ type build struct {
 	durations map[string]int64
 }
 
-// stage creates the build's directory exclusively (a new UUIDv7 never
-// exists; if it did, nothing would be adopted) and opens the album
-// directory as a root.
+// createBuildDir acquires ownership only if the exclusive mkdirat succeeded.
+func (b *Builder) createBuildDir(id uuid.UUID) (bool, error) {
+	err := b.work.Mkdir(buildDir(id), dirPerm)
+	// Mkdir joins a descriptor-close error after any mkdirat error. If the
+	// first filesystem error is from close, mkdirat succeeded and we still
+	// own the directory, but must fail the build and clean it up.
+	var fsErr *fsops.Error
+	return err == nil || (errors.As(err, &fsErr) && fsErr.Op == "close"), err
+}
+
+// stage creates the album directory inside the owned build directory and
+// opens it as a root.
 func (b *Builder) stage(id uuid.UUID) (*build, error) {
-	if err := b.work.Mkdir(buildDir(id), dirPerm); err != nil {
-		return nil, err
-	}
 	if err := b.work.Mkdir(StagingDir(id), dirPerm); err != nil {
 		return nil, err
 	}
@@ -417,7 +432,8 @@ func (bd *build) track(ctx context.Context, t Track, cover *media.Cover, expecte
 	if err != nil {
 		return err
 	}
-	bd.files = append(bd.files, ReceiptFile{RelativePath: t.Path, Size: size, SHA256: sum})
+	bd.files = append(bd.files, ReceiptFile{RelativePath: t.Path, Size: size, SHA256: sum,
+		TrackID: t.ID, SourceBlobSHA256: t.Blob.Hash})
 	closed = true
 	return bd.syncClose(f, t.Path)
 }
@@ -595,7 +611,8 @@ func (bd *build) receipt(ctx context.Context, p Plan) (string, error) {
 	if !slices.Equal(got, p.Files()) {
 		return "", errorf(CodeInvalidArgument, "the files built are not the plan's")
 	}
-	r := Receipt{AlbumID: p.AlbumID, BuildID: bd.id, AlbumRevision: p.AlbumRevision, RenderVersion: p.RenderVersion, Files: files}
+	r := Receipt{SchemaVersion: ReceiptSchemaVersion, StoreID: p.StoreID, AlbumID: p.AlbumID,
+		BuildID: bd.id, AlbumRevision: p.AlbumRevision, RenderVersion: p.RenderVersion, Files: files}
 	data, err := r.Encode()
 	if err != nil {
 		return "", err

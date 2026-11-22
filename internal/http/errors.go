@@ -50,6 +50,7 @@ const (
 	CodeUnknownField         = "unknown_field"          // 422
 	CodeMissingField         = "missing_field"          // 422
 	CodeInvalidField         = "invalid_field"          // 422
+	CodeInvalidMultipart     = "invalid_multipart"      // 422
 	CodeDuplicateID          = "duplicate_id"           // 422
 	CodeInvalidIfMatch       = "invalid_if_match"       // 400
 
@@ -102,6 +103,7 @@ var statusOf = map[string]int{
 
 	catalog.CodePathReserved:         nethttp.StatusConflict,
 	catalog.CodeAlbumFolderConflict:  nethttp.StatusConflict,
+	catalog.CodeCreationConflict:     nethttp.StatusConflict,
 	catalog.CodeArtistFolderConflict: nethttp.StatusConflict,
 	catalog.CodeArtistExists:         nethttp.StatusConflict,
 	// Two attachments whose output paths collide are a conflict of names

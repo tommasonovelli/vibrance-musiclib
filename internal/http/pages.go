@@ -21,6 +21,7 @@ import (
 var staticAssets = map[string]string{
 	"app.css":    "text/css; charset=utf-8",
 	"app.js":     "text/javascript; charset=utf-8",
+	"create.js":  "text/javascript; charset=utf-8",
 	"queue.js":   "text/javascript; charset=utf-8",
 	"library.js": "text/javascript; charset=utf-8",
 	"sidebar.js": "text/javascript; charset=utf-8",
@@ -108,6 +109,8 @@ func (a *API) Pages(w http.ResponseWriter, r *http.Request) {
 		a.importPage(w, r, b)
 	case r.URL.Path == "/activity":
 		a.activityPage(w, r, b.Catalog)
+	case r.URL.Path == "/albums/new":
+		a.createPage(w, r, b.Catalog)
 	case strings.HasPrefix(r.URL.Path, "/albums/"):
 		id, err := uuid.Parse(strings.TrimPrefix(r.URL.Path, "/albums/"))
 		if err != nil || id == uuid.Nil || id.String() != strings.TrimPrefix(r.URL.Path, "/albums/") {
@@ -149,8 +152,8 @@ func (a *API) staticAsset(w http.ResponseWriter, name string) {
 
 type pageData struct {
 	Title string
-	// Nav is the sidebar entry of the page: library, import, activity,
-	// trash or fix (the "Needs attention" filter).
+	// Nav is the sidebar entry of the page: library, create, import,
+	// activity, trash or fix (the "Needs attention" filter).
 	Nav string
 	// FixCount is the number of albums to fix, on every page (N-245).
 	FixCount int64
@@ -164,6 +167,7 @@ type pageData struct {
 	// Editor is the album page; it draws its own head (the title is a
 	// field), so the layout's page head is left out.
 	Editor *editorData
+	Draft  *draftData
 	// Import and Activity are the queue views (round 21, N-286 to N-289).
 	Import   *importView
 	Activity *activityView
@@ -514,6 +518,29 @@ func initials(title string) string {
 		return string(first)
 	}
 	return string([]rune{first[0], first[len(first)-1]})
+}
+
+type draftData struct {
+	ID      string
+	Artists []pageArtist
+}
+
+func (a *API) createPage(w http.ResponseWriter, r *http.Request, c *catalog.Service) {
+	artists, err := c.ListArtists(r.Context())
+	if err != nil {
+		a.fail(w, r, err)
+		return
+	}
+	id, err := uuid.NewRandom()
+	if err != nil {
+		a.fail(w, r, err)
+		return
+	}
+	d := &draftData{ID: id.String()}
+	for _, ar := range artists {
+		d.Artists = append(d.Artists, pageArtist{ID: ar.ID.String(), Name: ar.Name})
+	}
+	a.renderPage(w, r, c, "create.html", pageData{Title: "Create album", Nav: "create", Draft: d})
 }
 
 func (a *API) albumPage(w http.ResponseWriter, r *http.Request, c *catalog.Service, id uuid.UUID) {

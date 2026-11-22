@@ -44,8 +44,7 @@ func (im *Importer) ReadTrack(ctx context.Context, b blobstore.Blob, name string
 		return TrackInfo{}, ws, err
 	}
 	if !audio {
-		return TrackInfo{}, ws, &Error{Code: CodeUnsupportedAudio, Path: name,
-			Message: fmt.Sprintf("%q is not an audio file: a track must be FLAC, MP3 or M4A (AAC or ALAC)", name)}
+		return TrackInfo{}, ws, notAudio(name)
 	}
 	r, err := readTags(trackTags{Path: name, Tags: a.tags.Managed})
 	if err != nil {
@@ -61,4 +60,9 @@ func (im *Importer) ReadTrack(ctx context.Context, b blobstore.Blob, name string
 		}
 	}
 	return t, ws, nil
+}
+
+func notAudio(name string) *Error {
+	return &Error{Code: CodeUnsupportedAudio, Path: name,
+		Message: fmt.Sprintf("%q is not an audio file: a track must be FLAC, MP3 or M4A (AAC or ALAC)", name)}
 }

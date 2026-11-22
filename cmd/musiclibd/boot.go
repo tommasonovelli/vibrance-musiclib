@@ -235,7 +235,7 @@ func (d *daemon) boot(ctx context.Context) error {
 		return err
 	}
 	d.api.Enable(apihttp.Backend{Catalog: d.catalog, Blobs: d.blobs, Budget: d.budget, Work: d.vol.Work(), Source: d.source,
-		Tracks: d.importer})
+		Tracks: d.importer, Creation: d.importer})
 	d.log.Info("ready", "store_id", d.vol.StoreID().String())
 	d.ready.Store(d.pool)
 	return nil
@@ -533,7 +533,7 @@ func (d *daemon) buildPublisher() error {
 	if err != nil {
 		return err
 	}
-	d.publisher, err = publish.New(publish.Config{DB: d.pool, Library: d.vol.Library(), Work: d.vol.Work(),
+	d.publisher, err = publish.New(publish.Config{DB: d.pool, StoreID: d.vol.StoreID(), Library: d.vol.Library(), Work: d.vol.Work(),
 		Builder: builder, Log: d.log})
 	return err
 }

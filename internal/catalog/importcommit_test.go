@@ -112,7 +112,9 @@ func TestCommitImportIdempotent(t *testing.T) {
 	e := newEnv(t)
 	c := candidate(e.runningImport(), "Artist", "Album")
 	first := e.commit(c)
-	again := e.commit(c)
+	replay := c
+	replay.Fingerprint = "invalid" // A terminal job takes precedence over validation.
+	again := e.commit(replay)
 	if !again.AlreadyCompleted || again.State != jobs.StateDone || again.AlbumID != first.AlbumID {
 		t.Errorf("second commit %+v, want the first outcome, already completed", again)
 	}
@@ -315,7 +317,7 @@ func TestCommitImportDuplicate(t *testing.T) {
 
 	dup := c
 	dup.Attempt = e.runningImport()
-	dup.Title = "Another title: fingerprints, not metadata, identify an import"
+	dup.Title = "" // The matching fingerprint takes precedence over invalid metadata.
 	out := e.commit(dup)
 	if out.State != jobs.StateSkipped || out.AlbumID != first.AlbumID || out.ErrorCode != catalog.CodeDuplicateImport ||
 		strings.Contains(out.ErrorMessage, "trash") {
@@ -440,7 +442,13 @@ func TestCommitImportValidation(t *testing.T) {
 		code   string
 	}{
 		{"fingerprint", func(c *catalog.ImportCandidate) { c.Fingerprint = "ABC" }, catalog.CodeInvalidFingerprint},
-		{"empty artist", func(c *catalog.ImportCandidate) { c.Artist = " " }, names.CodeTextEmpty},
+		{"fingerprint before metadata", func(c *catalog.ImportCandidate) {
+			c.Fingerprint, c.Title = "invalid", ""
+		}, catalog.CodeInvalidFingerprint},
+		{"metadata before warnings", func(c *catalog.ImportCandidate) {
+			c.Artist = " "
+			c.Warnings = []jobs.Warning{{Code: "made_up", Message: "m"}}
+		}, names.CodeTextEmpty},
 		{"control title", func(c *catalog.ImportCandidate) { c.Title = "a\tb" }, names.CodeTextControlChar},
 		{"long title", func(c *catalog.ImportCandidate) { c.Title = strings.Repeat("x", 1025) }, names.CodeTextTooLong},
 		{"year 0", func(c *catalog.ImportCandidate) { c.Year = ptr(0) }, catalog.CodeInvalidYear},
@@ -507,8 +515,10 @@ func TestCommitImportValidation(t *testing.T) {
 		{"directories differing in case", func(c *catalog.ImportCandidate) {
 			c.Attachments = append(c.Attachments, catalog.ImportAttachment{RelPath: "scans/b.jpg", BlobHash: c.Blobs[4].Hash})
 		}, catalog.CodeAttachmentCollision},
-		{"warning", func(c *catalog.ImportCandidate) { c.Warnings = []jobs.Warning{{Code: "made_up", Message: "m"}} },
-			catalog.CodeInvalidImportWarnings},
+		{"warnings before blobs", func(c *catalog.ImportCandidate) {
+			c.Warnings = []jobs.Warning{{Code: "made_up", Message: "m"}}
+			c.Blobs[0].Size = -1
+		}, catalog.CodeInvalidImportWarnings},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := candidate(e.runningImport(), "Validation", "Album "+tc.name)

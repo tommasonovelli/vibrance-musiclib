@@ -1,0 +1,471 @@
+#!/usr/bin/env bash
+# Standalone host command. Run next to the installation's Compose file.
+set -euo pipefail
+
+say() { printf 'musiclib: %s\n' "$*" >&2; }
+fail() { say "$*"; exit 3; }
+usage() {
+  printf '%s\n' 'Usage: ./musiclib backup [NAME]          Save catalog and originals' \
+    '       ./musiclib restore NAME           Restore into new empty destinations' \
+    '       ./musiclib doctor [--deep]         Check without repairing' \
+    '       ./musiclib rebuild --store-id UUID Rebuild generated output, not originals'
+}
+bad_usage() { usage >&2; exit 2; }
+
+operation=${1:-}
+[[ $# == 0 ]] || shift
+case "$operation" in
+  -h|--help|help) [[ $# == 0 ]] || bad_usage; usage; exit 0 ;;
+  backup|restore)
+    if [[ $operation == backup && $# == 0 ]]; then
+      name=$(date -u +%Y-%m-%dT%H%M%SZ) || fail 'cannot generate backup name'
+    else
+      [[ $# == 1 ]] || bad_usage
+      name=$1
+    fi
+    case "$name" in
+      ''|.|..|*/*|*\\*|.musiclib-backup-*|*[[:cntrl:]]*)
+        say 'use one non-reserved directory name beneath /backup'; exit 2 ;;
+    esac
+    flag=--to
+    [[ $operation != restore ]] || flag=--from
+    set -- "$flag" "/backup/$name"
+    ;;
+  doctor) [[ $# == 0 || ( $# == 1 && $1 == --deep ) ]] || bad_usage ;;
+  rebuild)
+    hex='[0123456789abcdef]'
+    uuid="^${hex}{8}-${hex}{4}-${hex}{4}-${hex}{4}-${hex}{12}$"
+    [[ $# == 2 && $1 == --store-id && $2 =~ $uuid && $2 != 00000000-0000-0000-0000-000000000000 ]] || bad_usage
+    ;;
+  *) bad_usage ;;
+esac
+
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")" || fail 'cannot enter installation directory'
+root=$(pwd -P)
+compose_dir=$root
+case "${OSTYPE:-}" in
+  msys*|cygwin*)
+    export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'
+    compose_dir=$(pwd -W) || fail 'cannot resolve the native installation path'
+    ;;
+esac
+
+# Pin the selected local endpoint for this invocation. A path label on a remote
+# daemon is not evidence that the daemon belongs to this installation.
+local_docker() {
+  local endpoint context
+  if [[ -n ${DOCKER_HOST:-} && -z ${DOCKER_CONTEXT:-} ]]; then
+    endpoint=$DOCKER_HOST
+    docker_cmd=(docker --host "$endpoint")
+  else
+    context=$(docker context show) || fail 'cannot identify the Docker context'
+    endpoint=$(docker context inspect --format '{{.Endpoints.docker.Host}}' "$context") || fail 'cannot inspect the Docker context'
+    docker_cmd=(docker --context "$context")
+  fi
+  endpoint=${endpoint%$'\r'}
+  case "$endpoint" in
+    unix:///*) ;; # The following Docker calls verify that this endpoint answers.
+    npipe:////./pipe/*) [[ ${OSTYPE:-} == msys* || ${OSTYPE:-} == cygwin* ]] || fail 'not a local Windows Docker endpoint' ;;
+    *) fail 'maintenance requires a local Docker socket or named pipe' ;;
+  esac
+}
+engine() { "${docker_cmd[@]}" "$@"; }
+compose() { engine compose --project-directory "$compose_dir" "$@"; }
+
+lock=.musiclib-command.lock
+owned=0
+uncertain=0
+waiter=''
+owner="pid=$$ command=$operation started=$(date -u +%FT%TZ) token=$RANDOM-$RANDOM"
+# Called by the EXIT trap.
+# shellcheck disable=SC2329
+finish() {
+  if (( owned )); then
+    if (( uncertain )); then
+      say "leaving $root/$lock; verify Docker state and the offline outcome before clearing it or starting the app (see the operations guide)"
+    elif [[ $(<"$lock/owner") == "$owner" ]] && rm -- "$lock/owner" && rmdir -- "$lock"; then
+      :
+    else
+      say "could not release $root/$lock; inspect it before retrying"
+    fi
+  fi
+}
+# Called by the signal traps.
+# shellcheck disable=SC2329
+interrupted() {
+  uncertain=1
+  [[ -z $waiter ]] || kill "$waiter" 2>/dev/null || true
+  say 'interrupted; no further lifecycle actions will be attempted'
+  exit "$1"
+}
+trap finish EXIT
+trap 'interrupted 130' INT
+trap 'interrupted 143' TERM
+trap 'interrupted 129' HUP
+mkdir -- "$lock" 2>/dev/null || fail "cannot acquire $root/$lock; another command may own it (see the operations guide)"
+owned=1
+(umask 077; set -C; printf '%s\n' "$owner" > "$lock/owner") || fail 'cannot record command ownership'
+local_docker
+platform=$(engine info --format '{{.OperatingSystem}}') || fail 'cannot identify the Docker daemon'
+platform=${platform%$'\r'}
+
+# Compose's service hash excludes the top-level volume and network definitions.
+# Read only the needed resolved fields using JSON::PP in the already configured
+# PostgreSQL image. The probe has no network or installation mounts; a tmpfs
+# overrides the image's declared data volume. It never starts postgres.
+# No Compose model or resolved environment is printed or written to disk.
+project_model() {
+  local pg ref
+  ref=$(compose config --images postgres 2>/dev/null) || fail 'cannot resolve the PostgreSQL image from Compose'
+  ref=${ref%$'\r'}
+  [[ -n $ref && $ref != *[[:space:]]* ]] || fail 'expected one PostgreSQL image'
+  pg=$(local_image "$ref" "$operation")
+  # The single-quoted program is interpreted by Perl, not Bash.
+  # shellcheck disable=SC2016
+  compose config --format json app postgres 2>/dev/null | engine run --rm -i --pull never --network none \
+    --read-only --cap-drop ALL --tmpfs /var/lib/postgresql/data --security-opt no-new-privileges --user 65534:65534 \
+    --entrypoint perl "$pg" -MJSON::PP -MDigest::SHA=sha256_hex -e '
+      sub row {
+        for (@_) { defined && length && !/[\x00-\x1f\x7f|]/ or die "Unsupported Compose metadata\n"; }
+        print join("|", @_), "\n";
+      }
+      local $/;
+      my $p = eval { decode_json(<STDIN>) } or die "Invalid Compose JSON\n";
+      my %volume_keys;
+      my $network = $p->{networks}{default};
+      my $project = $p->{name};
+      # Match Compose resource hashes only for these simple model shapes.
+      # A mismatched network hash can make Compose disconnect containers.
+      my $net_name = $network->{name};
+      $net_name =~ /\A[a-zA-Z0-9][a-zA-Z0-9_.-]*\z/ && !grep(!/\A(?:name|ipam)\z/, keys %$network)
+        && !keys(%{$network->{ipam} // {}}) or die "Expected a managed default bridge without overrides\n";
+      row("project", $project, $net_name, sha256_hex(qq({"name":"$net_name","ipam":{}})));
+      for my $s (qw(app postgres)) {
+        my $svc = $p->{services}{$s};
+        my $nets = $svc->{networks};
+        $nets && keys(%$nets) == 1 && exists $nets->{default} && !$svc->{network_mode}
+          && !$svc->{volumes_from} && ($svc->{scale} // $svc->{deploy}{replicas} // 1) == 1
+          or die "Expected one instance per service on the default network\n";
+        row("image", $s, $svc->{image});
+        my %required = map { $_ => 1 } ($s eq "app" ? qw(/data /backup /import) : "/var/lib/postgresql/data");
+        for my $m (@{$svc->{volumes}}) {
+          my ($type, $src, $dst) = @{$m}{qw(type source target)};
+          delete $required{$dst};
+          if ($type eq "volume") {
+            my $v = $p->{volumes}{$src};
+            my $vol_name = $v->{name};
+            $vol_name =~ /\A[a-zA-Z0-9][a-zA-Z0-9_.-]*\z/ && ($v->{driver} // "local") eq "local"
+              && !grep(!/\A(?:name|driver)\z/, keys %$v) && !$m->{volume}{subpath}
+              or die "Expected a managed local volume without overrides or a subpath\n";
+            ($volume_keys{$vol_name} //= $src) eq $src or die "Named volumes must have distinct names\n";
+            row("volume", $src, $vol_name, sha256_hex(qq({"name":"$vol_name","driver":"local"})));
+            $src = $vol_name;
+          } elsif ($type ne "bind") { die "Expected a bind mount or managed named volume\n"; }
+          row($s, $type, $src, $dst, $m->{read_only} ? "false" : "true");
+        }
+        !keys(%required) or die "Missing a required service mount\n";
+      }
+    ' || fail 'cannot verify the resolved Compose mounts and services'
+}
+
+# Restore can fetch a missing image. Never proceed with an existing service
+# whose immutable image ID differs from that of its configured reference.
+local_image() {
+  local ref=$1 id
+  if ! id=$(engine image inspect --format '{{.Id}}' "$ref" 2>/dev/null); then
+    [[ $2 == restore ]] || fail 'configured image is not available locally'
+    engine pull "$ref" >&2 || fail 'cannot fetch the configured image (build source images first)'
+    id=$(engine image inspect --format '{{.Id}}' "$ref") || fail 'cannot identify the configured image'
+  fi
+  id=${id%$'\r'}
+  [[ $id =~ ^sha256:[0-9a-f]{64}$ ]] || fail 'unrecognized Docker image identity'
+  printf '%s\n' "$id"
+}
+
+load_project() {
+  local model kind a b rest hashes line volume_names network_names actual ownership
+  model=$(project_model) || fail 'maintenance was not started'
+  while IFS='|' read -r kind a b rest; do
+    case "$kind" in
+      project) project=$a; network=$b; network_hash=$rest ;;
+      image) if [[ $a == app ]]; then app_ref=$b; else pg_ref=$b; fi ;;
+      app) app_mounts+="$a|$b|$rest"$'\n' ;;
+      postgres) pg_mounts+="$a|$b|$rest"$'\n' ;;
+    esac
+  done <<<"${model//$'\r'/}"
+  [[ ${project:-} =~ ^[a-z0-9][a-z0-9_-]*$ && -n ${network:-} && -n ${app_ref:-} && -n ${pg_ref:-} && -n $app_mounts && -n $pg_mounts ]] \
+    || fail 'missing Compose service metadata'
+
+  hashes=$(compose config --hash '*' 2>/dev/null) || fail 'cannot resolve Compose service hashes'
+  while IFS= read -r line; do
+    case "$line" in
+      'app '*) app_hash=${line#app } ;;
+      'postgres '*) pg_hash=${line#postgres } ;;
+    esac
+  done <<<"${hashes//$'\r'/}"
+  [[ ${app_hash:-} =~ ^[0-9a-f]{64}$ && ${pg_hash:-} =~ ^[0-9a-f]{64}$ ]] || fail 'missing Compose service hashes'
+
+  app_id=$(service_id app)
+  pg_id=$(service_id postgres)
+  local image_policy=$operation
+  [[ -z $app_id ]] || image_policy=existing
+  app_image=$(local_image "$app_ref" "$image_policy")
+  pg_image=$(local_image "$pg_ref" existing)
+  volume_names=$(engine volume ls -q) || fail 'cannot list Docker volumes'
+  volume_names=${volume_names//$'\r'/}
+  while IFS='|' read -r kind a b rest; do
+    [[ $kind == volume && $'\n'"$volume_names"$'\n' == *$'\n'"$b"$'\n'* ]] || continue
+    actual=$(engine volume inspect --format '{{.Driver}}|{{.Scope}}|{{len .Options}}|{{index .Labels "com.docker.compose.project"}}|{{index .Labels "com.docker.compose.volume"}}|{{index .Labels "com.docker.compose.config-hash"}}' "$b") \
+      || fail 'cannot verify a configured Docker volume'
+    # Older Compose releases did not stamp resource hashes. Absence is OK
+    # only when ownership and the actual plain resource shape still match.
+    actual=${actual%$'\r'}
+    ownership="local|local|0|$project|$a|"
+    [[ $actual == "$ownership$rest" || $actual == "$ownership" ]] || fail "volume $b does not match the configured project volume"
+  done <<<"${model//$'\r'/}"
+  network_names=$(engine network ls --format '{{.Name}}') || fail 'cannot list Docker networks'
+  network_names=${network_names//$'\r'/}
+  if [[ $'\n'"$network_names"$'\n' == *$'\n'"$network"$'\n'* ]]; then
+    actual=$(engine network inspect --format '{{.Driver}}|{{.Scope}}|{{.Internal}}|{{.EnableIPv6}}|{{.Attachable}}|{{.Ingress}}|{{.ConfigOnly}}|{{.ConfigFrom.Network}}|{{.IPAM.Driver}}|{{len .IPAM.Options}}|{{len .IPAM.Config}}|{{range .IPAM.Config}}{{json .IPRange}}|{{len .AuxAddress}}|{{end}}{{json .Options}}|{{index .Labels "com.docker.compose.project"}}|{{index .Labels "com.docker.compose.network"}}|{{index .Labels "com.docker.compose.config-hash"}}' "$network") \
+      || fail 'cannot verify the configured Docker network'
+    actual=${actual%$'\r'}
+    # Newer clients/engines record default address-family settings as options.
+    local bridge='bridge|local|false|false|false|false|false||default|0|1|""|0|'
+    [[ $actual == "$bridge"* ]] || fail 'network does not match the configured project bridge'
+    actual=${actual#"$bridge"}
+    case "$actual" in
+      'null|'*|'{}|'*|'{"com.docker.network.enable_ipv4":"true"}|'*|\
+      '{"com.docker.network.enable_ipv4":"true","com.docker.network.enable_ipv6":"false"}|'*) actual=${actual#*|} ;;
+      *) fail 'network does not match the configured project bridge' ;;
+    esac
+    ownership="$project|default|"
+    [[ $actual == "$ownership$network_hash" || $actual == "$ownership" ]] || fail 'network does not match the configured project bridge'
+  elif [[ -n $app_id || -n $pg_id ]]; then
+    fail 'configured network does not match the existing installation'
+  fi
+}
+
+service_id() {
+  local ids
+  ids=$(engine container ls -aq --no-trunc --filter "label=com.docker.compose.project=$project" \
+    --filter "label=com.docker.compose.service=$1") || fail "cannot list $1 containers"
+  ids=${ids//$'\r'/}
+  [[ -z $ids || $ids =~ ^[a-f0-9]{64}$ ]] || fail "expected at most one $1 container; check for old or running one-offs"
+  printf '%s\n' "$ids"
+}
+
+inspect() {
+  local value
+  value=$(engine container inspect --format "$1" "$2") || return 1
+  printf '%s\n' "${value//$'\r'/}"
+}
+
+same_bind() {
+  local actual=$1 expected=$2
+  [[ $actual == "$expected" || $actual -ef $expected ]] && return 0
+  # Docker Desktop can prefix the local host path when resolving short binds.
+  [[ $platform == 'Docker Desktop' ]] || return 1
+  case "$actual" in
+    /host_mnt/*) actual=${actual#/host_mnt} ;;
+    /run/desktop/mnt/host/*) actual=${actual#/run/desktop/mnt/host} ;;
+    *) return 1 ;;
+  esac
+  [[ $actual -ef $expected ]]
+}
+
+check_service() {
+  local service=$1 id=$2 hash=$3 image=$4 expected=$5 folder actual mounts type src dst rw
+  [[ -n $id ]] || return 0
+  folder=$(inspect '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$id") || fail "cannot inspect $service ownership"
+  [[ -n $folder && $folder -ef $root ]] || fail "$service belongs to a different or unidentifiable installation directory"
+  # The dollar-prefixed variables below belong to Docker's Go template.
+  # shellcheck disable=SC2016
+  actual=$(inspect '{{index .Config.Labels "com.docker.compose.oneoff"}}|{{index .Config.Labels "com.docker.compose.config-hash"}}|{{.Image}}|{{range $name, $_ := .NetworkSettings.Networks}}{{$name}}|{{end}}' "$id") \
+    || fail "cannot inspect $service configuration"
+  [[ $actual == "False|$hash|$image|$network|" ]] || fail "$service configuration, image or network differs from Compose (or is a one-off)"
+  mounts=$(inspect '{{range .Mounts}}{{if ne .Type "tmpfs"}}{{printf "%s|" .Type}}{{if eq .Type "volume"}}{{.Name}}{{else}}{{.Source}}{{end}}{{printf "|%s|%t\n" .Destination .RW}}{{end}}{{end}}' "$id") \
+    || fail "cannot inspect $service mounts"
+  # Match actual mount targets, sources and modes, not logical volume keys.
+  local count=0 seen=$'\n' t source target writable match
+  while IFS='|' read -r type src dst rw; do
+    [[ -n $type && $seen != *$'\n'"$dst"$'\n'* ]] || fail "unrecognized mounts on $service"
+    seen+="$dst"$'\n'
+    match=0
+    while IFS='|' read -r t source target writable; do
+      [[ $type == "$t" && $dst == "$target" && $rw == "$writable" ]] || continue
+      if [[ $type == bind ]]; then
+        if same_bind "$src" "$source"; then match=1; fi
+      elif [[ $src == "$source" ]]; then
+        match=1
+      fi
+    done <<<"${expected%$'\n'}"
+    (( match )) || fail "$service mount at $dst differs from Compose"
+    count=$((count + 1))
+  done <<<"$mounts"
+  while IFS= read -r _; do count=$((count - 1)); done <<<"${expected%$'\n'}"
+  (( count == 0 )) || fail "$service is missing a configured mount"
+}
+
+state() { inspect '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$1"; }
+
+create_service() {
+  compose up --no-start --no-deps --no-recreate --no-build --pull never "$1" </dev/null >&2 || return 1
+  service_id "$1"
+}
+
+# 1 means a known readiness failure; 2 means Docker could not confirm state.
+wait_ready() {
+  local status end=$((SECONDS + 180))
+  while :; do
+    status=$(state "$1") || return 2
+    case "$status" in
+      'running|healthy') return 0 ;;
+      'running|starting'|restarting\|*) ;;
+      *) return 1 ;;
+    esac
+    (( SECONDS < end )) || return 1
+    sleep 1
+  done
+}
+
+run_offline() {
+  local result status oom started ended name="${project}-musiclib-offline"
+  say "running offline $operation ($name)"
+  offline_id=$(compose run -d -T --interactive=false --no-deps --pull never --name "$name" app "$operation" "$@" </dev/null) \
+    || fail 'cannot confirm that the offline container started; not starting the app'
+  offline_id=${offline_id%$'\r'}
+  [[ $offline_id =~ ^[0-9a-f]{64}$ ]] || fail 'cannot identify the offline container; not starting the app'
+  "${docker_cmd[@]}" container wait "$offline_id" >/dev/null &
+  waiter=$!
+  wait "$waiter" || fail 'Docker did not confirm offline completion; not starting the app'
+  waiter=''
+  result=$(inspect '{{.State.Status}}|{{.State.ExitCode}}|{{.State.OOMKilled}}|{{.State.Error}}|{{.State.StartedAt}}|{{.State.FinishedAt}}' "$offline_id") \
+    || fail 'cannot verify offline completion; not starting the app'
+  if [[ $result =~ ^exited\|(0|[1-9][0-9]{0,2})\|(true|false)\|\|([^\|]+)\|([^\|]+)$ ]]; then
+    status=${BASH_REMATCH[1]} oom=${BASH_REMATCH[2]} started=${BASH_REMATCH[3]} ended=${BASH_REMATCH[4]}
+    [[ $started != 0001-* && $ended != 0001-* ]] || fail 'offline process did not run to completion'
+  else
+    fail 'offline process state is uncertain or abnormal; not starting the app'
+  fi
+  if (( status > 2 )) || [[ $oom == true ]]; then
+    say "offline process exited abnormally ($status); not starting the app"
+    (( status != 0 )) && exit "$status"
+    exit 3
+  fi
+  offline_status=$status
+  if [[ $operation == doctor && $status == 1 ]]; then
+    # 1.2.0 also exits 1 when inspection is cancelled or fails. Forward
+    # stdout and stderr, but require the exact report summary on stdout.
+    # With pipefail, a Docker logs error is not a completed report either.
+    # shellcheck disable=SC2016
+    if ! engine container logs "$offline_id" | awk '
+      { print; last = $0 }
+      END { if (last !~ /^Doctor found damaged or inconsistent data\. Nothing was changed\.\r?$/) exit 1 }
+    '; then
+      offline_housekeeping_failed 'cannot confirm a completed doctor report from offline logs'
+    fi
+  elif ! engine container logs "$offline_id"; then
+    offline_housekeeping_failed 'cannot read offline logs'
+  fi
+  if ! engine container rm "$offline_id" >/dev/null; then
+    offline_housekeeping_failed 'cannot confirm offline container removal'
+  fi
+}
+
+report_completion() {
+  if (( offline_status == 0 )); then
+    case "$operation" in
+      backup) say "backup is complete: /backup/$name" ;;
+      restore) say 'catalog and originals are restored' ;;
+    esac
+  fi
+}
+
+offline_housekeeping_failed() {
+  report_completion
+  say "$1 (Docker recorded exit $offline_status); not starting the app"
+  (( offline_status == 0 )) || exit "$offline_status"
+  exit 3
+}
+
+start_app() {
+  local ready=0
+  if [[ -z $app_id ]]; then
+    app_id=$(create_service app) || return 2
+    [[ -n $app_id ]] || return 2
+    (check_service app "$app_id" "$app_hash" "$app_image" "$app_mounts") || return 2
+  fi
+  engine container start "$app_id" >/dev/null || return 2
+  wait_ready "$app_id" || ready=$?
+  return "$ready"
+}
+
+app_mounts='' pg_mounts=''
+load_project
+check_service app "$app_id" "$app_hash" "$app_image" "$app_mounts"
+check_service postgres "$pg_id" "$pg_hash" "$pg_image" "$pg_mounts"
+app_state=absent pg_state=absent
+if [[ -n $app_id ]]; then app_state=$(state "$app_id") || fail 'cannot inspect app state'; fi
+if [[ -n $pg_id ]]; then pg_state=$(state "$pg_id") || fail 'cannot inspect PostgreSQL state'; fi
+was_running=0
+case "$app_state" in
+  running\|*) was_running=1 ;;
+  absent|created\|*|exited\|*) ;;
+  *) fail 'app is not in a stable running or stopped state' ;;
+esac
+if [[ $operation == restore ]]; then
+  (( ! was_running )) || fail 'restore refuses a running target app; select a new empty installation'
+  case "$pg_state" in
+    absent|created\|*|exited\|*|running\|*) ;;
+    *) fail 'PostgreSQL is not in a stable running or stopped state' ;;
+  esac
+  uncertain=1
+  if [[ -z $pg_id ]]; then
+    pg_id=$(create_service postgres) || fail 'cannot create target PostgreSQL'
+    [[ -n $pg_id ]] || fail 'cannot identify target PostgreSQL'
+    check_service postgres "$pg_id" "$pg_hash" "$pg_image" "$pg_mounts"
+  fi
+  if [[ $pg_state != running\|* ]]; then
+    say 'starting only PostgreSQL'
+    engine container start "$pg_id" >/dev/null || fail 'cannot confirm target PostgreSQL startup'
+  fi
+  db_ready=0
+  wait_ready "$pg_id" || db_ready=$?
+  (( db_ready != 1 )) || uncertain=0
+  (( db_ready == 0 )) || fail 'target PostgreSQL did not become healthy; restore was not started'
+else
+  [[ $pg_state == 'running|healthy' ]] || fail 'PostgreSQL must already be running and healthy; nothing was stopped'
+  uncertain=1
+  if (( was_running )); then
+    say 'stopping app (PostgreSQL remains up)'
+    engine container stop "$app_id" >/dev/null || fail 'cannot confirm app stop; offline command was not started'
+    app_state=$(state "$app_id") || fail 'cannot verify app stop; offline command was not started'
+    [[ $app_state == exited\|* ]] || fail 'app did not stop; offline command was not started'
+  fi
+fi
+
+run_offline "$@"
+if (( offline_status != 0 )) && [[ ! ( $operation == doctor && $offline_status == 1 ) ]]; then
+  uncertain=0
+  say "offline $operation exited $offline_status; app remains stopped. Follow the offline diagnostics and the operations guide before starting it or retrying."
+  exit "$offline_status"
+fi
+
+report_completion
+if [[ $operation == restore ]] || (( was_running )); then
+  startup=0
+  start_app || startup=$?
+  case "$startup" in
+    0) say 'MusicLib is ready'; [[ $operation != restore ]] || say 'output regeneration may still be running in Activity' ;;
+    *)
+      say "offline $operation finished (exit $offline_status), but MusicLib is not ready; inspect app startup logs. Do not repeat a completed operation to fix startup."
+      (( startup != 1 )) || uncertain=0
+      (( offline_status == 0 )) || exit "$offline_status"
+      exit 3
+      ;;
+  esac
+else
+  say 'app was not running and was left stopped'
+fi
+uncertain=0
+exit "$offline_status"

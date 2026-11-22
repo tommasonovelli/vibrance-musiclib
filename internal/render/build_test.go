@@ -58,6 +58,7 @@ func kindOfBlueAlbum(t *testing.T, e *env) *album {
 func TestBuildAlbum(t *testing.T) {
 	e := newEnv(t)
 	a := kindOfBlueAlbum(t, e)
+	a.attach("not-a-track.flac", []byte("attachment bytes"))
 	p := a.plan()
 	res := e.mustBuild(p)
 
@@ -82,12 +83,23 @@ func TestBuildAlbum(t *testing.T) {
 		t.Fatal(err)
 	}
 	if ReceiptHash(files[ReceiptName]) != res.ReceiptHash || r.BuildID != res.BuildID || r.AlbumID != a.s.Album.ID ||
-		r.AlbumRevision != 2 || r.RenderVersion != Version || len(r.Files) != len(p.Files()) {
+		r.AlbumRevision != 2 || r.RenderVersion != Version || len(r.Files) != len(p.Files()) ||
+		r.SchemaVersion != ReceiptSchemaVersion || r.StoreID != a.s.StoreID {
 		t.Fatalf("receipt %v, hash %s", r, res.ReceiptHash)
+	}
+	tracks := map[string]jobs.SnapshotTrack{
+		"01 - So What.flac": a.s.Tracks[0], "02 - Freddie Freeloader.flac": a.s.Tracks[1],
 	}
 	for _, f := range r.Files {
 		if b := files[f.RelativePath]; int64(len(b)) != f.Size || sha(b) != f.SHA256 {
 			t.Errorf("receipt entry %+v does not describe the file", f)
+		}
+		tr := tracks[f.RelativePath]
+		if f.TrackID != tr.ID || f.SourceBlobSHA256 != tr.Blob.Hash {
+			t.Errorf("receipt entry %+v does not match snapshot track %s (blob %s)", f, tr.ID, tr.Blob.Hash)
+		}
+		if tr.ID != uuid.Nil && f.SHA256 == f.SourceBlobSHA256 {
+			t.Errorf("retagged track has the original hash: %+v", f)
 		}
 	}
 
@@ -136,6 +148,35 @@ func TestBuildAlbum(t *testing.T) {
 	e.checkNoBuilds()
 	if err := e.b.Discard(context.Background(), res.BuildID); err != nil {
 		t.Fatalf("a second Discard: %v", err)
+	}
+}
+
+func TestBuildPreservesOccupiedForeignStaging(t *testing.T) {
+	e := newEnv(t)
+	a := e.album("Artist", "Occupied")
+	a.track(1, 1, "One", song{})
+	a.attach("Scans/notes.txt", []byte("foreign attachment"))
+	foreign := a.plan()
+	occupied := e.mustBuild(foreign)
+	occupied.Space.Release()
+	files, _, _ := e.staged(occupied)
+	r, err := ParseReceipt(files[ReceiptName])
+	if err != nil || r.SchemaVersion != 2 || r.StoreID != foreign.StoreID {
+		t.Fatalf("expected a v2 receipt for store %s, got %+v, %v", foreign.StoreID, r, err)
+	}
+
+	local := foreign
+	local.StoreID[0] ^= 1 // Same album and build IDs, different store lineage.
+	before := e.tree("work/render")
+	res, err := e.b.build(context.Background(), local, func() uuid.UUID { return occupied.BuildID })
+	if !errors.Is(err, syscall.EEXIST) {
+		t.Fatalf("Build: %v, want EEXIST", err)
+	}
+	if got := e.b.budget.Reserved(); got != 0 || res.Space != nil || res.BuildID != uuid.Nil {
+		t.Errorf("failed build returned %+v and left %d bytes reserved", res, got)
+	}
+	if after := e.tree("work/render"); !mapsEqual(before, after) {
+		t.Fatalf("occupied staging changed:\nbefore %v\nafter  %v", before, after)
 	}
 }
 

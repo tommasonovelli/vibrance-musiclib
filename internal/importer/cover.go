@@ -32,15 +32,19 @@ const (
 // candidate.
 var coverNames = [...]string{"cover", "folder", "front"}
 
-// validateCover is §8.5's check of an image (media.ValidateCover), with a
-// refusal turned into the plain reason the job's warning quotes.
+// validateCover returns a reason safe to quote in a cover-skip warning.
 func validateCover(r io.ReadSeeker, size int64) (string, error) {
 	format, err := media.ValidateCover(r, size)
+	if err == nil {
+		return format, nil
+	}
 	var me *media.Error
 	if errors.As(err, &me) && me.Code == media.CodeInvalidImage {
 		return "", errors.New(me.Msg)
 	}
-	return format, err
+	// A failed read can include the absolute path of the opened blob or
+	// work file in its cause. Keep the same fallback, without that cause.
+	return "", errors.New("the image could not be read")
 }
 
 // coverTrack is a track as the cover selection sees it: its path, its blob

@@ -49,6 +49,7 @@ func kindOfBlue() *jobs.RenderSnapshot {
 	t1.Lyrics = jobs.SnapshotBlob{Hash: hashOf("lrc"), Size: 42}
 	return &jobs.RenderSnapshot{
 		Attempt:       jobs.Attempt{JobID: uuid.New(), Ticket: 7},
+		StoreID:       uuid.New(),
 		RenderVersion: Version,
 		Artist:        jobs.SnapshotArtist{ID: uuid.New(), Name: "Miles Davis", Revision: 1},
 		Album: jobs.SnapshotAlbum{ID: uuid.New(), Title: "Kind of Blue", Year: 1959, Genre: textOf("Jazz"),
@@ -91,14 +92,14 @@ func TestPlanKindOfBlue(t *testing.T) {
 	if p.Dir != catalog.AlbumPath("Miles Davis", "Kind of Blue") || p.Dir.Path != "Miles Davis/Kind of Blue" {
 		t.Fatalf("dir %+v", p.Dir)
 	}
-	if p.AlbumID != s.Album.ID || p.AlbumRevision != 3 || p.RenderVersion != Version || p.Removal {
+	if p.StoreID != s.StoreID || p.AlbumID != s.Album.ID || p.AlbumRevision != 3 || p.RenderVersion != Version || p.Removal {
 		t.Fatalf("identity %+v", p)
 	}
 	if p.Cover == nil || p.Cover.Path != "cover.jpg" || p.Cover.MIME != "image/jpeg" || p.Cover.Blob.Hash != s.Cover.Hash {
 		t.Fatalf("cover %+v", p.Cover)
 	}
 	for i, tr := range p.Tracks {
-		if tr.Blob.Hash != s.Tracks[i].Blob.Hash || tr.Blob.Size != s.Tracks[i].Blob.Size || tr.Format != "flac" {
+		if tr.ID != s.Tracks[i].ID || tr.Blob.Hash != s.Tracks[i].Blob.Hash || tr.Blob.Size != s.Tracks[i].Blob.Size || tr.Format != "flac" {
 			t.Errorf("track %d: %+v", i, tr)
 		}
 	}
@@ -396,6 +397,9 @@ func TestPlanRefusals(t *testing.T) {
 	}{
 		{"another render version", func(s *jobs.RenderSnapshot) { s.RenderVersion = "other" }, CodeVersionMismatch},
 		{"no tracks", func(s *jobs.RenderSnapshot) { s.Tracks = nil }, CodeInvalidSnapshot},
+		{"nil store", func(s *jobs.RenderSnapshot) { s.StoreID = uuid.Nil }, CodeInvalidSnapshot},
+		{"nil track ID", func(s *jobs.RenderSnapshot) { s.Tracks[0].ID = uuid.Nil }, CodeInvalidSnapshot},
+		{"duplicate track ID", func(s *jobs.RenderSnapshot) { s.Tracks[0].ID = s.Tracks[1].ID }, CodeInvalidSnapshot},
 		{"not audio", func(s *jobs.RenderSnapshot) { s.Tracks[0].Blob.Format = "" }, CodeInvalidSnapshot},
 		{"a GIF cover", func(s *jobs.RenderSnapshot) { s.Cover.Format = "" }, CodeInvalidSnapshot},
 		{"an invalid hash", func(s *jobs.RenderSnapshot) { s.Tracks[1].Blob.Hash = strings.ToUpper(s.Tracks[1].Blob.Hash) }, CodeInvalidSnapshot},

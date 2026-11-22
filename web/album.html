@@ -1,4 +1,5 @@
 {{define "body"}}{{with .Editor}}{{$id := .Album.ID}}{{$api := printf "/api/albums/%s" .Album.ID}}{{$multi := .MultiDisc}}{{$lyrics := .LyricsAttachments}}{{$artist := .Album.ArtistName}}{{$genre := .Genre}}<div id="editor" data-id="{{$id}}" data-etag="{{.ETag}}" data-trashed="{{.Album.Trashed}}">
+<section id="creation-warnings" class="notice" aria-labelledby="creation-warnings-title" hidden><h2 id="creation-warnings-title">Creation notes</h2><ul></ul><a href="/activity">View publication in Activity</a></section>
 <form id="metadata" class="album" data-area spellcheck="false" autocomplete="off">
 {{if .Album.Trashed}}<p class="band">This album is in the trash.{{if .Album.Tracks}}<button class="btn" type="button" data-js hidden data-method="POST" data-url="{{$api}}/restore">Restore</button>{{end}}</p>{{end}}
 <div id="head-notice" class="notice" role="alert" tabindex="-1" hidden><p></p><button class="btn" type="button" data-action="reapply" hidden>Reload and reapply my changes</button><details hidden><summary>Details</summary><pre></pre></details></div>

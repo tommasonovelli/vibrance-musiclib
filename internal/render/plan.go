@@ -39,6 +39,7 @@ const extrasDir = "Extras"
 // and nothing modifies it after NewPlan returns it (the builder only reads
 // it).
 type Plan struct {
+	StoreID uuid.UUID
 	AlbumID uuid.UUID
 	// AlbumRevision is the revision the snapshot read; the receipt and the
 	// journal record it (§6.3: never the current revision).
@@ -80,6 +81,7 @@ type Cover struct {
 
 // Track is one track file.
 type Track struct {
+	ID uuid.UUID
 	// Path is "<NN> - <title>.<ext>", under "Disc <D>/" when the album is
 	// multi-disc (§5.1).
 	Path string
@@ -142,7 +144,10 @@ func NewPlan(s *jobs.RenderSnapshot, renderVersion string) (Plan, error) {
 		return Plan{}, errorf(CodeVersionMismatch, "the snapshot was claimed for render_version %q, the plan is for %q",
 			s.RenderVersion, renderVersion)
 	}
-	p := Plan{AlbumID: s.Album.ID, AlbumRevision: s.Album.Revision, RenderVersion: renderVersion}
+	if s.StoreID == uuid.Nil {
+		return Plan{}, errorf(CodeInvalidSnapshot, "the snapshot has no store identity")
+	}
+	p := Plan{StoreID: s.StoreID, AlbumID: s.Album.ID, AlbumRevision: s.Album.Revision, RenderVersion: renderVersion}
 	if s.Album.Revision <= 0 {
 		return Plan{}, errorf(CodeInvalidSnapshot, "album %s has revision %d", s.Album.ID, s.Album.Revision)
 	}
@@ -150,8 +155,8 @@ func NewPlan(s *jobs.RenderSnapshot, renderVersion string) (Plan, error) {
 		p.Removal = true
 		return p, nil
 	}
-	if len(s.Tracks) == 0 {
-		return Plan{}, errorf(CodeInvalidSnapshot, "album %s is active without tracks (§4.3)", s.Album.ID)
+	if len(s.Tracks) == 0 || len(s.Tracks) > catalog.MaxTracks {
+		return Plan{}, errorf(CodeInvalidSnapshot, "active album %s has %d tracks, expected 1 to %d", s.Album.ID, len(s.Tracks), catalog.MaxTracks)
 	}
 	p.Dir = catalog.AlbumPath(s.Artist.Name, s.Album.Title)
 	ns := &namespace{}
@@ -210,8 +215,13 @@ func planTracks(s *jobs.RenderSnapshot, cover *Cover, ns *namespace) ([]Track, [
 	discTotal, trackTotals := totals(tracks)
 	var out []Track
 	var lyrics []Copy
+	seen := make(map[uuid.UUID]struct{}, len(tracks))
 	for _, t := range tracks {
 		name := trackName(t)
+		if _, duplicate := seen[t.ID]; duplicate || t.ID == uuid.Nil {
+			return nil, nil, errorf(CodeInvalidSnapshot, "%s has a duplicate or nil track ID", name)
+		}
+		seen[t.ID] = struct{}{}
 		if t.Disc < 1 || t.Disc > 99 || t.No < 1 || t.No > 999 {
 			return nil, nil, errorf(CodeInvalidSnapshot, "%s is out of the schema's range", name)
 		}
@@ -236,7 +246,7 @@ func planTracks(s *jobs.RenderSnapshot, cover *Cover, ns *namespace) ([]Track, [
 		if !ok {
 			return nil, nil, errorf(CodeInvalidSnapshot, "the file name of %s lost its extension", name)
 		}
-		tr := Track{Path: dir + file, Blob: blob, Format: t.Blob.Format,
+		tr := Track{ID: t.ID, Path: dir + file, Blob: blob, Format: t.Blob.Format,
 			Tags: expectedTags(s, t, discTotal, trackTotals[t.Disc]), ProbeDuration: !t.DurationKnown}
 		if err := ns.add(entry{path: tr.Path, name: name}); err != nil {
 			return nil, nil, err

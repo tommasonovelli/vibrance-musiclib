@@ -16,6 +16,7 @@ import (
 	"musiclib/internal/importer"
 	"musiclib/internal/jobs"
 	"musiclib/internal/media"
+	"musiclib/internal/store"
 	"musiclib/internal/store/pgtest"
 )
 
@@ -27,6 +28,10 @@ func TestBuildFromCatalog(t *testing.T) {
 	e := newEnv(t)
 	db := pgtest.New(t)
 	ctx := context.Background()
+	storeID := store.NewID()
+	if _, err := store.New(db).InsertStoreID(ctx, storeID); err != nil {
+		t.Fatal(err)
+	}
 	src := filepath.Join(t.TempDir(), "import")
 	write := func(rel string, b []byte) {
 		p := filepath.Join(src, filepath.FromSlash(rel))
@@ -83,7 +88,7 @@ func TestBuildFromCatalog(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.Dir.Path != "Miles Davis/Kind of Blue" || p.AlbumRevision != 1 {
+	if p.Dir.Path != "Miles Davis/Kind of Blue" || p.AlbumRevision != 1 || p.StoreID != storeID {
 		t.Fatalf("plan %+v", p)
 	}
 	want := []string{"01 - So What.flac", "01 - So What.lrc", "02 - Freddie Freeloader.flac",

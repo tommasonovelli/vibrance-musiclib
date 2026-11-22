@@ -157,7 +157,13 @@ func (s *Service) GetAlbum(ctx context.Context, id uuid.UUID) (AlbumView, error)
 	return v, err
 }
 
-func readAlbumView(ctx context.Context, q *store.Queries, id uuid.UUID) (AlbumView, error) {
+type albumViewReader interface {
+	GetAlbumView(context.Context, uuid.UUID) (store.GetAlbumViewRow, error)
+	ListAlbumTrackViews(context.Context, uuid.UUID) ([]store.ListAlbumTrackViewsRow, error)
+	ListAlbumAttachmentViews(context.Context, uuid.UUID) ([]store.ListAlbumAttachmentViewsRow, error)
+}
+
+func readAlbumView(ctx context.Context, q albumViewReader, id uuid.UUID) (AlbumView, error) {
 	al, err := q.GetAlbumView(ctx, id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return AlbumView{}, errorf(CodeAlbumNotFound, "album %s does not exist", id)

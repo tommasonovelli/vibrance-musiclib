@@ -465,6 +465,10 @@ func TestSnapshotCoherence(t *testing.T) {
 	cover, audio1, audio2, lrc, pdf := f.blob("jpeg"), f.blob("flac"), f.blob("flac"), f.blob(""), f.blob("")
 	build := store.NewID()
 	receipt := newHash()
+	storeID := store.NewID()
+	if _, err := store.New(f.db).InsertStoreID(ctx, storeID); err != nil {
+		t.Fatal(err)
+	}
 	f.exec(`INSERT INTO artists (id, name, folder_key, revision) VALUES ($1, 'Miles Davis', 'miles davis', 3)`, artist)
 	f.exec(`INSERT INTO albums (id, artist_id, title, folder_key, year, genre, compilation, cover_hash, revision,
 			published_path, published_revision, published_renderer, published_build, published_receipt_hash)
@@ -486,6 +490,7 @@ func TestSnapshotCoherence(t *testing.T) {
 		}
 		once.Do(func() {
 			// A catalog change committed after the snapshot was taken.
+			f.exec(`UPDATE settings SET store_id = $1`, store.NewID())
 			f.exec(`UPDATE tracks SET title = 'changed', disc = 2 WHERE album_id = $1`, album)
 			f.exec(`UPDATE attachments SET rel_path = 'changed.pdf' WHERE album_id = $1`, album)
 			f.exec(`UPDATE albums SET title = 'changed' WHERE id = $1`, album)
@@ -497,6 +502,7 @@ func TestSnapshotCoherence(t *testing.T) {
 	}
 	want := &RenderSnapshot{
 		Attempt:       Attempt{JobID: e.JobID, Ticket: e.Requested},
+		StoreID:       storeID,
 		RenderVersion: testRenderer,
 		Artist:        SnapshotArtist{ID: artist, Name: "Miles Davis", Revision: 3},
 		Album: SnapshotAlbum{ID: album, Title: "Kind of Blue", Year: 1959, Genre: Text{"Jazz", true}, Compilation: true,

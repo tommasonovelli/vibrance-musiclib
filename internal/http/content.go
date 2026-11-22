@@ -16,6 +16,7 @@ import (
 	"musiclib/internal/blobstore"
 	"musiclib/internal/catalog"
 	"musiclib/internal/importer"
+	"musiclib/internal/jobs"
 	"musiclib/internal/media"
 )
 
@@ -333,7 +334,11 @@ func (h *handlers) postTrack(w nethttp.ResponseWriter, r *nethttp.Request) {
 		h.api.fail(w, r, err)
 		return
 	}
-	out := addedTrackJSON{albumJSON: albumRep(v), Warnings: make([]warningJSON, len(ws))}
+	h.api.writeJSON(w, nethttp.StatusCreated, albumWithWarnings(v, ws))
+}
+
+func albumWithWarnings(v catalog.AlbumView, ws []jobs.Warning) albumWarningsJSON {
+	out := albumWarningsJSON{albumJSON: albumRep(v), Warnings: make([]warningJSON, len(ws))}
 	for i, wn := range ws {
 		out.Warnings[i] = warningJSON{Code: string(wn.Code), Message: wn.Message}
 		if wn.Path != "" {
@@ -341,13 +346,10 @@ func (h *handlers) postTrack(w nethttp.ResponseWriter, r *nethttp.Request) {
 			out.Warnings[i].Path = &p
 		}
 	}
-	h.api.writeJSON(w, nethttp.StatusCreated, out)
+	return out
 }
 
-// addedTrackJSON is the answer of POST /api/albums/{id}/tracks: the album
-// after the change and the warnings of the file's reading, as an import
-// reports them (an empty list without any).
-type addedTrackJSON struct {
+type albumWarningsJSON struct {
 	albumJSON
 	Warnings []warningJSON `json:"warnings"`
 }

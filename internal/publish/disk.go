@@ -50,15 +50,18 @@ type entry struct {
 // holds reports whether the directory is exactly the build of j: its
 // receipt names the album and the build, and has the journal's hash (§9.4:
 // "ricevuta con build_id e hash attesi").
-func (e entry) holds(j Journal) bool {
-	return e.kind == directory && e.receipt != nil && e.receipt.AlbumID == j.AlbumID &&
+func (e entry) holds(j Journal, storeID uuid.UUID) bool {
+	return e.receipt != nil && !e.foreign(j.AlbumID, storeID) &&
 		e.receipt.BuildID == j.BuildID && e.receiptHash == j.ReceiptHash
 }
 
-// foreign reports whether the directory carries the receipt of another
-// album: never replaced nor retired (§9.3).
-func (e entry) foreign(album uuid.UUID) bool {
-	return e.kind == directory && e.receipt != nil && e.receipt.AlbumID != album
+func (e entry) foreignStore(storeID uuid.UUID) bool {
+	return e.receipt != nil && e.receipt.ForeignStore(storeID)
+}
+
+// foreign distinguishes another store or album's receipt from damage.
+func (e entry) foreign(album, storeID uuid.UUID) bool {
+	return e.receipt != nil && (e.receipt.AlbumID != album || e.foreignStore(storeID))
 }
 
 // observe describes rel under root without following anything: fsops
@@ -107,7 +110,7 @@ func readReceipt(root *fsops.Root, dir string) (_ []byte, err error) {
 			err = wrap(CodeIO, cerr, "closing the receipt of %s", dir)
 		}
 	}()
-	data, err := io.ReadAll(io.LimitReader(f, render.MaxReceiptBytes+1))
+	data, err := io.ReadAll(io.LimitReader(f, int64(render.MaxReceiptBytes)+1))
 	if err != nil {
 		return nil, wrap(CodeIO, err, "reading the receipt of %s", dir)
 	}
@@ -135,7 +138,12 @@ func (p *Publisher) checkStaging(j Journal, code string) error {
 		return errorf(code, "%s: the staging %s is a %s", j, j.staging(), e.what)
 	case e.receipt == nil:
 		return errorf(code, "%s: the staging %s has no valid receipt", j, j.staging())
-	case !e.holds(j) || e.receipt.AlbumRevision != j.Revision || e.receipt.RenderVersion != j.Renderer:
+	case e.foreignStore(p.storeID):
+		if code == CodeStagingInvalid {
+			code = CodeForeignOutput
+		}
+		return errorf(code, "%s: the staging holds output from another store", j)
+	case !e.holds(j, p.storeID) || e.receipt.AlbumRevision != j.Revision || e.receipt.RenderVersion != j.Renderer:
 		return errorf(code, "%s: the staging's receipt is %s with hash %s", j, e.receipt, e.receiptHash)
 	}
 	return nil
@@ -188,7 +196,7 @@ func (p *Publisher) preflight(j Journal) error {
 		if err != nil {
 			return err
 		}
-		if err := checkNew(j, e, CodeUnsafeEntry, CodeDestinationOccupied, CodeForeignOutput); err != nil {
+		if err := p.checkNew(j, e, CodeUnsafeEntry, CodeDestinationOccupied, CodeForeignOutput); err != nil {
 			return err
 		}
 	}
@@ -197,7 +205,10 @@ func (p *Publisher) preflight(j Journal) error {
 		if err != nil {
 			return err
 		}
-		if err := checkOld(j, e, CodeUnsafeEntry, CodeForeignOutput); err != nil {
+		if err := p.checkOld(j, e, CodeUnsafeEntry, CodeForeignOutput); err != nil {
+			return err
+		}
+		if err := p.checkWorkStore(j.retired(), CodeForeignOutput); err != nil {
 			return err
 		}
 	}
@@ -206,16 +217,16 @@ func (p *Publisher) preflight(j Journal) error {
 
 // checkNew is the ownership rule of §9.3 for the new path: absent, or the
 // album's own published directory (exactly the old path), whatever it holds
-// except another album's receipt: a missing receipt or an altered file
+// except another album's or store's receipt: a missing receipt or an altered file
 // there is output damage, which the build replaces.
-func checkNew(j Journal, e entry, unsafeCode, occupiedCode, foreignCode string) error {
+func (p *Publisher) checkNew(j Journal, e entry, unsafeCode, occupiedCode, foreignCode string) error {
 	switch {
 	case e.kind == absent:
 		return nil
 	case e.kind == unsafe:
 		return errorf(unsafeCode, "%s: the new path is a %s", j, e.what)
-	case e.foreign(j.AlbumID):
-		return errorf(foreignCode, "%s: the new path holds the output of album %s", j, e.receipt.AlbumID)
+	case e.foreign(j.AlbumID, p.storeID):
+		return errorf(foreignCode, "%s: the new path holds foreign output (%s)", j, e.receipt)
 	case j.NewPath != j.OldPath:
 		return errorf(occupiedCode, "%s: the new path is already a directory that this album has not published; "+
 			"move it out of the library (§3.3)", j)
@@ -224,13 +235,13 @@ func checkNew(j Journal, e entry, unsafeCode, occupiedCode, foreignCode string) 
 }
 
 // checkOld is the rule for the old path to retire: absent (already
-// retired), or a directory without another album's receipt.
-func checkOld(j Journal, e entry, unsafeCode, foreignCode string) error {
+// retired), or a directory without another album's or store's receipt.
+func (p *Publisher) checkOld(j Journal, e entry, unsafeCode, foreignCode string) error {
 	switch {
 	case e.kind == unsafe:
 		return errorf(unsafeCode, "%s: the old path is a %s", j, e.what)
-	case e.foreign(j.AlbumID):
-		return errorf(foreignCode, "%s: the old path holds the output of album %s", j, e.receipt.AlbumID)
+	case e.foreign(j.AlbumID, p.storeID):
+		return errorf(foreignCode, "%s: the old path holds foreign output (%s)", j, e.receipt)
 	}
 	return nil
 }
@@ -269,7 +280,7 @@ func (p *Publisher) install(ctx context.Context, j Journal) error {
 		if err != nil {
 			return err
 		}
-		if !e.holds(j) {
+		if !e.holds(j, p.storeID) {
 			if err := p.installNew(j, e); err != nil {
 				return err
 			}
@@ -308,8 +319,14 @@ func (p *Publisher) checkTransition(j Journal) error {
 		if err != nil {
 			return err
 		}
-		if !e.holds(j) {
-			if err := checkNew(j, e, CodeIllegalState, CodeIllegalState, CodeIllegalState); err != nil {
+		if e.holds(j, p.storeID) {
+			// After exchange, staging may hold the previous output. Never
+			// finalize and clean it as ours if it names a different store.
+			if err := p.checkWorkStore(j.staging(), CodeIllegalState); err != nil {
+				return err
+			}
+		} else {
+			if err := p.checkNew(j, e, CodeIllegalState, CodeIllegalState, CodeIllegalState); err != nil {
 				return err
 			}
 			if err := p.checkStaging(j, CodeIllegalState); err != nil {
@@ -324,17 +341,20 @@ func (p *Publisher) checkTransition(j Journal) error {
 		return nil
 	}
 	e, err := observe(p.library, j.OldPath)
-	if err != nil || e.kind == absent {
+	if err != nil {
 		return err
 	}
-	if err := checkOld(j, e, CodeIllegalState, CodeIllegalState); err != nil {
+	if err := p.checkOld(j, e, CodeIllegalState, CodeIllegalState); err != nil {
 		return err
 	}
 	r, err := observe(p.work, j.retired())
 	if err != nil {
 		return err
 	}
-	if r.kind != absent {
+	if r.foreignStore(p.storeID) {
+		return errorf(CodeIllegalState, "%s: %s holds output from another store", j, j.retired())
+	}
+	if e.kind != absent && r.kind != absent {
 		return errorf(CodeIllegalState, "%s: %s already exists and the old directory is still in the library", j, j.retired())
 	}
 	return nil
@@ -344,7 +364,7 @@ func (p *Publisher) checkTransition(j Journal) error {
 // what the preflight checked: under publishMu nothing of this process can
 // have changed it, but a recovery starts from whatever the disk holds.
 func (p *Publisher) installNew(j Journal, e entry) error {
-	if err := checkNew(j, e, CodeIllegalState, CodeIllegalState, CodeIllegalState); err != nil {
+	if err := p.checkNew(j, e, CodeIllegalState, CodeIllegalState, CodeIllegalState); err != nil {
 		return err
 	}
 	if err := p.checkStaging(j, CodeIllegalState); err != nil {
@@ -415,7 +435,7 @@ func (p *Publisher) retireOld(j Journal) error {
 	if e.kind == absent {
 		return nil // already retired (§9.3): not a reason to delete anything else
 	}
-	if err := checkOld(j, e, CodeIllegalState, CodeIllegalState); err != nil {
+	if err := p.checkOld(j, e, CodeIllegalState, CodeIllegalState); err != nil {
 		return err
 	}
 	if err := fsops.RenameNoReplace(p.library, j.OldPath, p.work, j.retired()); err != nil {
@@ -489,12 +509,35 @@ func depth(rel string) int {
 // the retired directory (§9.3). A failure is an operational warning, never
 // a failed publication; the boot resumes it (§11.1 step 5).
 func (p *Publisher) cleanup(ctx context.Context, j Journal) {
-	for _, rel := range []string{buildDir(j.BuildID), j.retired()} {
-		if err := p.work.RemoveAll(ctx, rel); err != nil && fsops.Code(err) != fsops.CodeNotFound {
-			p.log.Warn("cleanup after the publication failed; the boot will resume it", "album_id", j.AlbumID,
-				"build_id", j.BuildID, "path", rel, "error", err.Error())
+	for _, dirs := range [][2]string{{buildDir(j.BuildID), j.staging()}, {j.retired(), j.retired()}} {
+		if err := p.removeWork(ctx, dirs[0], dirs[1]); err != nil {
+			p.log.Warn("cleanup after the publication left a work tree in place", "album_id", j.AlbumID,
+				"build_id", j.BuildID, "path", dirs[0], "error", err.Error())
 		}
 	}
+}
+
+func (p *Publisher) checkWorkStore(receiptDir, code string) error {
+	e, err := observe(p.work, receiptDir)
+	if err != nil {
+		return err
+	}
+	if e.foreignStore(p.storeID) {
+		return errorf(code, "%s holds output from another store", receiptDir)
+	}
+	return nil
+}
+
+// removeWork checks the receipt at the album directory before removing its
+// work tree. Invalid or partial builds remain disposable; foreign v2 is not.
+func (p *Publisher) removeWork(ctx context.Context, tree, receiptDir string) error {
+	if err := p.checkWorkStore(receiptDir, CodeForeignOutput); err != nil {
+		return err
+	}
+	if err := p.work.RemoveAll(ctx, tree); fsops.Code(err) != fsops.CodeNotFound {
+		return err
+	}
+	return nil
 }
 
 // buildDir is render/<build_id>, the staging's parent, relative to work/.
