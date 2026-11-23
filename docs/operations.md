@@ -271,6 +271,8 @@ library/
 
 **Treat the library folder as read-only.** Change metadata in MusicLib, never in the library: see [Other programs and the library folder](#other-programs-and-the-library-folder).
 
+Repeat renders in the same MusicLib process can reuse the decoded audio digest of a verified original. Every render verifies the original and the staging copy, checks the rewritten tags, and fully decodes the finished track to verify that the audio matches. The digest is kept in bounded memory and is discarded on restart.
+
 ### Publication receipts
 
 New builds write receipt schema 2. The receipt records `store_id`, `album_id`, `build_id`, `album_revision`, `render_version` and an inventory of relative paths, sizes and `sha256` hashes of the published files. Each published audio track also carries its catalog `track_id` and `source_blob_sha256`, the hash of the immutable original. The published hash is computed independently from the finished, tagged file; use it to verify the library copy, not the source hash. Covers, lyrics and extra files have no track/source pair.

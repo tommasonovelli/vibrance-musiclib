@@ -10,6 +10,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/google/uuid"
 	"golang.org/x/sys/unix"
@@ -71,22 +72,61 @@ type Config struct {
 	// created yet), write (before each write of a copy or of the receipt;
 	// Path and File), duration (before the probe of a duration the catalog
 	// does not know, N-301: an error there is a failed probe; Path and
-	// File), tags_written (after a track's tag write; Path and
-	// File), fsync_file and fsync_dir (before each fsync; Path relative to
+	// File), prewrite_digest (before an uncached input digest; Path and
+	// File), tags_written (after a track's tag write; Path and File),
+	// fsync_file and fsync_dir (before each fsync; Path relative to
 	// the album, or to work for a directory).
 	Failpoints failpoint.Hook
 }
 
 // Builder builds the staging directory of a plan (§9.1 steps 4 to 8). It
-// is safe for concurrent use by the pool's workers: every build has its own
-// directory and state. It never opens library/: it has no root for it.
+// is safe for concurrent use by the pool's workers. Every build has its own
+// directory. The input digests are shared by this builder's workers. It
+// never opens library/: it has no root for it.
 type Builder struct {
-	tools  *media.Tools
-	blobs  *blobstore.Store
-	work   *fsops.Root
-	budget *jobs.Budget
+	tools   *media.Tools
+	blobs   *blobstore.Store
+	work    *fsops.Root
+	budget  *jobs.Budget
+	digests inputDigests
 	// failpoints is Config.Failpoints.
 	failpoints failpoint.Hook
+}
+
+// inputDigestLimit bounds the number of digests remembered by one builder.
+const inputDigestLimit = 4096
+
+// inputDigests remembers the PCM of verified original bytes for this builder
+// and its pinned decoder. The hash covers the whole original, including any
+// headers or metadata that affect the decode. Entries are evicted in insertion
+// order, and the mutex is held only for index operations.
+type inputDigests struct {
+	mu     sync.Mutex
+	byBlob map[Blob]media.Digest
+	order  [inputDigestLimit]Blob
+	next   int
+}
+
+func (d *inputDigests) get(blob Blob) (media.Digest, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	digest, ok := d.byBlob[blob]
+	return digest, ok
+}
+
+func (d *inputDigests) remember(blob Blob, digest media.Digest) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if _, ok := d.byBlob[blob]; ok {
+		return
+	}
+	if d.byBlob == nil {
+		d.byBlob = make(map[Blob]media.Digest)
+	}
+	delete(d.byBlob, d.order[d.next])
+	d.byBlob[blob] = digest
+	d.order[d.next] = blob
+	d.next = (d.next + 1) % len(d.order)
 }
 
 // New returns a builder and creates work/render durably if missing.
@@ -157,10 +197,10 @@ func (b *Builder) Discard(ctx context.Context, buildID uuid.UUID) error {
 //     SHA-256, compares it with the blob's name (a corrupt original stops
 //     the build, blobstore.CodeCorrupt), and reads the copy back (§9.1
 //     steps 5 and 7);
-//  2. for a track: the audio digest of the copy, its tags inspected, the
-//     managed tags written, inspected again and verified against the plan
-//     and the first inspection (media.VerifyTags), the digest again; the
-//     two digests must be equal (§8.4, §9.1 step 6);
+//  2. for a track: get the input audio digest from the builder or decode the
+//     verified copy. Inspect the input tags, write and reread the managed
+//     tags, and check the result against the plan and the first inspection
+//     (media.VerifyTags). Decode the tagged copy and compare both digests;
 //  3. the final size and SHA-256 of every file, then the receipt (§9.2);
 //     every file is fsynced when it is complete, then every new directory
 //     bottom-up, the album directory, and its parents render/<build_id>,
@@ -375,9 +415,8 @@ func (bd *build) run(ctx context.Context, p Plan) (_ string, err error) {
 	return hash, bd.syncDirs()
 }
 
-// track builds one track (§9.1 step 6): the verified copy, the audio digest
-// before, the tag write, the reread of the managed and unmanaged tags, the
-// audio digest after.
+// track verifies the original and staged copy before looking up the input
+// digest. Every tag write is followed by tag verification and a full decode.
 func (bd *build) track(ctx context.Context, t Track, cover *media.Cover, expected *media.ExpectedCover) (err error) {
 	f, err := bd.copy(ctx, t.Path, t.Blob)
 	if err != nil {
@@ -390,9 +429,14 @@ func (bd *build) track(ctx context.Context, t Track, cover *media.Cover, expecte
 		}
 	}()
 	tools := bd.b.tools
-	before, err := tools.AudioDigest(ctx, f)
-	if err != nil {
-		return err
+	before, reused := bd.b.digests.get(t.Blob)
+	if !reused {
+		if err := bd.b.failpoints.HitFile("prewrite_digest", t.Path, f); err != nil {
+			return err
+		}
+		if before, err = tools.AudioDigest(ctx, f); err != nil {
+			return err
+		}
 	}
 	if t.ProbeDuration {
 		// A probe that fails leaves the duration unknown for a later render:
@@ -435,7 +479,13 @@ func (bd *build) track(ctx context.Context, t Track, cover *media.Cover, expecte
 	bd.files = append(bd.files, ReceiptFile{RelativePath: t.Path, Size: size, SHA256: sum,
 		TrackID: t.ID, SourceBlobSHA256: t.Blob.Hash})
 	closed = true
-	return bd.syncClose(f, t.Path)
+	if err := bd.syncClose(f, t.Path); err != nil {
+		return err
+	}
+	if !reused {
+		bd.b.digests.remember(t.Blob, before)
+	}
+	return nil
 }
 
 // duration reads the duration of a track whose blob's duration the catalog

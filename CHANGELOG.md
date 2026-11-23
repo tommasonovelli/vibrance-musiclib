@@ -12,6 +12,7 @@ Versions follow [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html)
 
 ### Changed
 
+- Repeat renders can reuse the verified input audio digest while MusicLib is running. Each render still verifies the original and staging bytes, checks the tags and fully decodes the finished audio before publication.
 - New publications write receipt schema 2 with store lineage and stable track IDs, plus each track's original hash alongside its independently computed published hash. Canonical v1 receipts and pending v1 publications remain readable. The renderer revision is now 4: after recovery, stale output is replaced by normal whole-album renders. Back up before upgrading and allow time and space for those renders. Restore preserves lineage; rollback requires a compatible pre-upgrade backup in a fresh environment, not an older binary over newer output.
 
 - The install block and the guides use the folder `~/vibrance` instead of `~/musiclib`. An existing installation keeps working where it is: run its commands from its own folder.

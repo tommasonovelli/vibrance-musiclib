@@ -13,8 +13,8 @@ import (
 
 // Digest is the identity of the decoded audio of a track (§8.4): the same
 // sequence of samples and parameters, as decoded by the pinned ffmpeg. It is
-// transient and never stored (§8.4); it is comparable only with a digest
-// computed by the same binary on the same machine (NOTES.md N-079).
+// kept only in process memory and is comparable only with a digest computed
+// by the same binary on the same machine.
 type Digest struct {
 	SampleRate int
 	Channels   int
@@ -100,12 +100,11 @@ func decodeArgs(demuxer string) []string {
 // does not decode completely, with CodeDecode. Timeouts (DecodeTimeout) and
 // cancellation have their own codes. f follows the rules of Probe.
 //
-// The render's comparison of §9.1 step 6 calls AudioDigest on the input
-// copy before the tag write and on the written copy after it, and compares
-// the two digests, nothing else. The ID3v1 tag that the write strips
-// (N-090) is the one step 2 leaves out of the input's decode, so both
-// digests describe the same stream, and they are equal when the write kept
-// the audio. The caller needs no knowledge of ID3 tags.
+// The renderer compares the digest of the verified original bytes with a
+// fresh digest of the tagged copy. Step 2 excludes the same trailing ID3v1
+// tag that the tag write removes, so both digests describe the same stream
+// when the write keeps the audio. The caller needs no knowledge of ID3
+// tags.
 func (t *Tools) AudioDigest(ctx context.Context, f *os.File) (Digest, error) {
 	p, err := t.Probe(ctx, f)
 	if err != nil {
