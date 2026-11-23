@@ -3,8 +3,8 @@
 // import and uploads alike.
 //
 // Layout: originals/ab/cd/<sha256>, temporaries in work/blobs/<random>.tmp;
-// both roots are on the same filesystem (§3.1). There is no operation that
-// removes or rewrites a pinned blob (§3.2 guarantee 2, no GC in v1).
+// both roots are on the same filesystem. Pinned originals are never
+// rewritten. Confined removal uses the catalog removal journal.
 package blobstore
 
 import (
@@ -42,13 +42,16 @@ type Blob struct {
 // Store holds the originals root and the work root that contains the
 // temporaries. It is safe for concurrent use.
 type Store struct {
-	originals *fsops.Root
-	work      *fsops.Root
+	originals  *fsops.Root
+	work       *fsops.Root
+	registered func(context.Context, string) (bool, error)
 	// failpoints is nil in production. The package's tests set it to
 	// inject an error, or to crash the process, at the named points of a
 	// put: temp_synced, temp_verified, shards_synced, pinned (§12.2,
 	// NOTES.md N-142).
 	failpoints failpoint.Hook
+	// removalSteps is nil in production (SetRemovalSteps).
+	removalSteps func(*fsops.Root) RemovalSteps
 }
 
 // New returns a Store over the two roots, creating work/blobs durably if it
@@ -58,6 +61,18 @@ func New(originals, work *fsops.Root) (*Store, error) {
 		return nil, wrap("create temp dir", "", err)
 	}
 	return &Store{originals: originals, work: work}, nil
+}
+
+// NewRegistered enables the online check for a known hash with a missing
+// canonical file. The caller holds shared originals admission across the
+// put and any subsequent transaction that registers a reference.
+func NewRegistered(originals, work *fsops.Root, registered func(context.Context, string) (bool, error)) (*Store, error) {
+	s, err := New(originals, work)
+	if err != nil {
+		return nil, err
+	}
+	s.registered = registered
+	return s, nil
 }
 
 // OpenReadOnly exposes only the existing originals for offline verification.
@@ -113,6 +128,28 @@ func (s *Store) Put(ctx context.Context, src io.Reader) (_ Blob, err error) {
 	// Step 3: the chain is synced even when it already existed, because a
 	// concurrent put may have created it and not synced it yet.
 	shard, rel := shardOf(b.SHA256), relOf(b.SHA256)
+	mustExist := false
+	if s.registered != nil {
+		_, err := s.originals.Stat(rel)
+		switch {
+		case missingLeaf(err):
+			mustExist, err = s.registered(ctx, b.SHA256)
+			if err != nil {
+				return Blob{}, err
+			}
+			if mustExist {
+				// A concurrent admitted put may have just registered a
+				// newly pinned file. Verify it through normal deduplication.
+				if _, err := s.originals.Stat(rel); err != nil {
+					return Blob{}, &Error{Code: CodeCorrupt, Op: "check registered original", SHA: b.SHA256, Err: err}
+				}
+			}
+		case err == nil:
+			mustExist = true
+		default:
+			return Blob{}, wrap("check canonical original", b.SHA256, err)
+		}
+	}
 	if _, err := s.originals.MkdirAll(shard, dirPerm); err != nil {
 		return Blob{}, wrap("create shard", b.SHA256, err)
 	}
@@ -124,16 +161,22 @@ func (s *Store) Put(ctx context.Context, src io.Reader) (_ Blob, err error) {
 	}
 
 	// Step 4.
-	err = fsops.RenameNoReplace(s.work, tmp, s.originals, rel)
-	switch {
-	case err == nil:
-		renamed = true
-	case fsops.Code(err) == fsops.CodeExists:
+	if mustExist {
 		if err := s.checkExisting(ctx, b); err != nil {
 			return Blob{}, err
 		}
-	default:
-		return Blob{}, wrap("pin", b.SHA256, err)
+	} else {
+		err = fsops.RenameNoReplace(s.work, tmp, s.originals, rel)
+		switch {
+		case err == nil:
+			renamed = true
+		case fsops.Code(err) == fsops.CodeExists:
+			if err := s.checkExisting(ctx, b); err != nil {
+				return Blob{}, err
+			}
+		default:
+			return Blob{}, wrap("pin", b.SHA256, err)
+		}
 	}
 	if err := s.failpoints.Hit("pinned"); err != nil {
 		return Blob{}, wrap("pinned", b.SHA256, err)

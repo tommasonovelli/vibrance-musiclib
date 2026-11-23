@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"musiclib/internal/failpoint"
+	"musiclib/internal/reclaim"
 	"musiclib/internal/store"
 )
 
@@ -40,6 +41,7 @@ type Pool struct {
 	log           *slog.Logger
 	poll          time.Duration
 	wake          chan struct{}
+	admission     *reclaim.Admission
 	// claimMu makes the workers claim one at a time. The claim is a
 	// REPEATABLE READ transaction (§6.2), and FOR UPDATE SKIP LOCKED skips
 	// only rows locked right now: a job that another worker claimed and
@@ -69,6 +71,9 @@ func NewPool(db *pgxpool.Pool, workers int, renderVersion string, exec Executor,
 		poll: pollInterval, wake: make(chan struct{}, 1),
 	}, nil
 }
+
+// SetAdmission wires the process guard before Run starts.
+func (p *Pool) SetAdmission(a *reclaim.Admission) { p.admission = a }
 
 // Wake tells an idle worker to look for work now, instead of at its next
 // poll. The catalog calls it after a commit that enqueued something. It
@@ -117,6 +122,9 @@ func (p *Pool) worker(ctx context.Context, id int, stop func(error)) {
 	defer timer.Stop()
 	for {
 		busy, err := p.step(ctx, log)
+		if errors.Is(err, reclaim.ErrStopped) {
+			return
+		}
 		if Stops(err) {
 			log.Error("fatal failure, stopping the workers", "error", err, "code", Code(err))
 			stop(err)
@@ -145,7 +153,21 @@ func (p *Pool) worker(ctx context.Context, id int, stop func(error)) {
 // pending.
 func (p *Pool) step(ctx context.Context, log *slog.Logger) (busy bool, err error) {
 	p.claimMu.Lock()
+	release, err := p.admission.Enter(ctx)
+	if err != nil {
+		p.claimMu.Unlock()
+		return false, err
+	}
+	defer func() {
+		if Stops(err) {
+			p.admission.Fence(err)
+		}
+		release()
+	}()
 	c, err := claimNext(ctx, p.db, p.renderVersion, p.failpoints)
+	if Stops(err) {
+		p.admission.Fence(err)
+	}
 	p.claimMu.Unlock()
 	if err != nil || c == nil {
 		return false, err

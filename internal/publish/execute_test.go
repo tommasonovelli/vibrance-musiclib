@@ -20,6 +20,7 @@ import (
 	"musiclib/internal/importer"
 	"musiclib/internal/jobs"
 	"musiclib/internal/media"
+	"musiclib/internal/reclaim"
 	"musiclib/internal/render"
 	"musiclib/internal/store"
 	"musiclib/internal/store/pgtest"
@@ -355,4 +356,52 @@ func TestExecuteRenderSupersededAndCancelled(t *testing.T) {
 	if j, _ := m.renderJob(c.Render.Album.ID); j.State != "running" {
 		t.Fatalf("job %s after a shutdown, want running", j.State)
 	}
+}
+
+func TestExecuteRenderFencesAfterUnknownDurationCommit(t *testing.T) {
+	m := newMediaEnv(t)
+	writeAlbum(t, m.src, "a", "Artist", "Album", 1)
+	m.importAll()
+	for m.count(`SELECT count(*) FROM albums`) == 0 {
+		c, err := jobs.ClaimNext(t.Context(), m.db, render.Version)
+		if err != nil || c == nil || c.Kind == jobs.KindRender {
+			t.Fatalf("import claim: %+v, %v", c, err)
+		}
+		if err := m.execute(t.Context(), c); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m.exec(`UPDATE blobs SET duration_ms = NULL`)
+	id := m.albumID("Album")
+
+	proxy := pgtest.NewProxy(t, m.dbURL)
+	p := m.publisher(pgtest.Pool(t, proxy.URL))
+	pool, err := jobs.NewPool(m.db, 1, render.Version, p.ExecuteRender, p.log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission := reclaim.NewAdmission()
+	pool.SetAdmission(admission)
+	proxy.LoseNextCommitAck()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	if err := pool.Run(ctx); store.Code(err) != store.CodeCommitUncertain {
+		t.Fatalf("worker did not stop after the uncertain duration commit: %v", err)
+	}
+	if store.Code(admission.Err()) != store.CodeCommitUncertain {
+		t.Fatalf("worker released admission without fencing: %v", admission.Err())
+	}
+	if n := m.count(`SELECT count(*) FROM blobs WHERE duration_ms IS NOT NULL`); n != 1 {
+		t.Fatalf("duration transaction did not commit: %d", n)
+	}
+	if _, pending := m.journal(); pending || m.album(id).PublishedRevision != 0 {
+		t.Fatal("the render crossed into publication after the uncertain commit")
+	}
+	if j, ok := m.renderJob(id); !ok || j.State != "running" {
+		t.Fatalf("job did not remain for boot recovery: %+v", j)
+	}
+	if _, err := p.CleanWork(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	m.wantWorkClean()
 }

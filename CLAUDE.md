@@ -4,7 +4,7 @@ These are the rules and principles for anyone who changes this repository, human
 
 ## What MusicLib is
 
-A personal, single-user music library manager. It imports album folders from a read-only `/import` mount, keeps every imported file as an immutable, content-addressed original, lets the user correct artists, albums, tracks, covers, attachments and lyrics in a browser, and generates `library/`: ordinary folders and tagged FLAC, MP3 and M4A (AAC/ALAC) files for any player to read. It is one Go server (`musiclibd`) with embedded HTML/CSS/JS, PostgreSQL 17, a small C++ TagLib helper and pinned FFmpeg, shipped as a Docker image and run with Docker Compose. **Few features, done well**: simplicity is a permanent requirement, not a phase.
+A personal, single-user music library manager. It imports album folders from a read-only `/import` mount, stores imported files as immutable, content-addressed originals, lets the user correct artists, albums, tracks, covers, attachments and lyrics in a browser, and generates `library/`: ordinary folders and tagged FLAC, MP3 and M4A (AAC/ALAC) files for any player to read. It is one Go server (`musiclibd`) with embedded HTML/CSS/JS, PostgreSQL 17, a small C++ TagLib helper and pinned FFmpeg, shipped as a Docker image and run with Docker Compose. **Few features, done well**: simplicity is a permanent requirement, not a phase.
 
 ## Repository layout
 
@@ -18,7 +18,8 @@ internal/render/        snapshot -> pure plan -> complete build in staging; rend
 internal/publish/       publication journal, directory renames, recovery
 internal/jobs/          durable queue: claim, worker pool, completion, boot recovery
 internal/media/         adapters of ffprobe/ffmpeg and of the TagLib helper
-internal/blobstore/     durable put and verified reads of originals
+internal/blobstore/     durable put, verified reads and confined unlink of originals
+internal/reclaim/       originals admission, removal journal and recovery
 internal/fsops/         Linux filesystem primitives confined to their roots (openat2)
 internal/volume/        /data lock, store marker, boot checks of the volume
 internal/maintenance/   doctor, rebuild, backup, restore
@@ -71,13 +72,18 @@ docs/                   operations and Docker guides
 - `/data/.musiclib-store` and `settings.store_id` pair the volume with its database; a mismatch is refused and a marker is never rewritten automatically.
 - `/data/.maintenance` (rebuild/restore in progress) blocks the boot until the same operation completes; it is never removed by hand.
 - `/import` is a separate read-only mount outside `/data`; `/backup` is outside `/data` too.
-- Free space: every import, build and upload reserves its conservative size estimate in one process-wide budget (`internal/jobs`), and starts only if the free space of `/data`, minus a 1 GiB safety margin and every other reservation, covers it; otherwise it fails with `insufficient_space` (`507` for an upload). The budget is not a guarantee: every write still handles `ENOSPC`, a disk that fills up during a build leaves the published album and the originals intact, and nothing published or original is ever removed to make room.
+- Free space: every import, build and upload reserves its conservative size estimate in one process-wide budget (`internal/jobs`), and starts only if the free space of `/data`, minus a 1 GiB safety margin and every other reservation, covers it; otherwise it fails with `insufficient_space` (`507` for an upload). The budget is not a guarantee: every write still handles `ENOSPC`, a disk that fills up during a build leaves the published album and the originals intact, and space reservations never delete published output or originals.
 
 ### Originals and blobs
 
 - One put primitive (`internal/blobstore`): temp file in `work/blobs`, hash while copying, `fsync`, checked `close`, re-read and verify, `renameat2(RENAME_NOREPLACE)` into the shard, fsync of the directories.
-- An existing blob is verified before being trusted; a mismatch is `corrupt_blob`, never an overwrite. A fixed blob is never modified or deleted by the application; there is no garbage collector, and unreferenced blobs are information, not errors.
-- Blobs become durable before any transaction references them.
+- An existing blob is verified before being trusted; a mismatch is `corrupt_blob`, never an overwrite. The bytes of a pinned blob are immutable. The only application deletion of an original is a completed journaled removal.
+- Blobs become durable before any transaction references them. Online puts refuse to recreate a missing original that has a committed reference, a reclamation row or an armed removal; only an orphan with none of them may be pinned again.
+- A forward migration seeds live hashes from committed references. Deferred triggers maintain eligibility from the final state of track audio, track lyrics, attachments and covers, including trashed albums. Only a committed last-reference loss makes a hash eligible, with a new generation. A committed reattachment invalidates the generation. Old orphans and failed puts that never had a committed reference stay.
+- Online HTTP and worker entry points take shared admission before reading uploads, looking up references or claiming jobs. They keep it through the last use, close and transaction outcome. A fatal outcome fences admission before release. Shutdown joins all admitted work before closing the database or releasing the volume lock, including after an HTTP connection is forced closed.
+- A pass takes exclusive admission only when no operation holds or awaits it; it never queues, so active use defers collection. It then takes the catalog lock for short checks. It verifies the exact store, hash, size, generation and zero references, verifies a regular canonical file and its SHA-256, then commits one durable store-bound intent. After acknowledgement it unlinks only that file, fsyncs and closes the shard, and atomically deletes the intent, candidate and blob row. Unknown commits or unsafe filesystem state fence the process until restart.
+- Before arming, a candidate whose canonical name in its verified shard is proven absent, or a regular file of another size or SHA-256, is a local refusal: nothing changes, it keeps its registration and generation, and it is logged (`original_reclamation_deferred`) and skipped by generation until restart. Any other error, a joined close error, an unexpected entry or a missing shard is not a local refusal. Doctor reports such candidates; deep doctor is needed for same-size damage.
+- Boot resolves an armed removal under the volume lock after checking volume identity and filesystem, before serving the catalog, claiming work or cleaning temporary files. A matching intent and existing shard allow replay with a verified leaf or with no leaf, followed by shard fsync and atomic finalize. A mismatched or unsafe state, including a damaged present leaf, stops startup and preserves the journal; the documented recovery is a known-good earlier backup restored into a new empty installation.
 
 ### Import
 
@@ -96,7 +102,7 @@ docs/                   operations and Docker guides
 - One render job row per album; workers claim with `FOR UPDATE SKIP LOCKED`; completion is conditional on the claimed ticket, so a stale result never completes a newer request.
 - An artist left without any album (trashed albums count) is deleted in the transaction that moves its last album away, or that empties the trash of its last album.
 - A move of tracks changes both albums in one transaction under the catalog lock: both revisions bumped, both renders enqueued. An album left without tracks goes to the trash in that transaction; only a trashed album may have no tracks, and it cannot be restored then.
-- Emptying the trash (`POST /api/trash/empty`, one catalog transaction) deletes the catalog rows of the trashed albums whose removal from `library/` is complete (no published path, no render job, no journal), never an original or a blob row. An album whose removal is still pending, running or failed waits; nothing deletes trashed albums automatically.
+- Emptying the trash (`POST /api/trash/empty`, one catalog transaction) deletes the catalog rows of the trashed albums whose removal from `library/` is complete (no published path, no render job, no journal), and records last-reference losses in the same commit. Original removal runs separately. An album whose removal is still pending, running or failed waits; nothing deletes trashed albums automatically.
 - Serialization failures and deadlocks retry the short transaction (at most three times, with jitter). A lost database connection or an uncertain commit is never retried blindly: the process stops workers and mutations, exits, and recovers on restart.
 
 ### Render and publication
@@ -140,7 +146,7 @@ docs/                   operations and Docker guides
 - Configuration comes only from the environment: `DATABASE_URL`, `PUBLIC_ORIGIN`, `HTTP_ADDR`, `WORKERS`, and `MUSICLIB_PASSWORD` for the server. Container paths are fixed (`/data`, `/import`, `/backup`).
 - The database password is defined once per Compose file (`x-db-password`): `POSTGRES_PASSWORD` from `.env`, else the default `musiclib`, which the docs tell users to change before the first start. The app receives it as `PGPASSWORD` (read by pgx) and `DATABASE_URL` carries none.
 - Never root: `musiclibd` refuses uid 0 and sets umask 022; the app container runs without capabilities, with a read-only root filesystem. PostgreSQL keeps `fsync`, `full_page_writes` and `synchronous_commit` on and publishes no port.
-- `doctor`, `rebuild`, `backup` and `restore` run offline (app stopped, PostgreSQL up) and take the volume lock. Doctor never repairs; restore only into a new empty database and volume, never over an installation; backups are never overwritten. The standalone `musiclib` command coordinates host-side lifecycle, not storage: verify the installation before touching services, do not reconcile configuration drift, and do not start the app on failed or uncertain offline completion. Doctor's confirmed completed-findings exit 1 is the only nonzero offline result that permits restarting a previously running app.
+- `doctor`, `rebuild`, `backup` and `restore` run offline (app stopped, PostgreSQL up) and take the volume lock. Doctor reports armed removals without repair. Backup and rebuild refuse armed removals before any writes. Restore verifies the archive, refuses an armed removal under the maintenance marker, keeps all archived originals and seeds only live references. Restore requires a new empty database and volume. Backups are immutable. The standalone `musiclib` command coordinates host-side lifecycle, not storage: verify the installation before touching services, do not reconcile configuration drift, and do not start the app on failed or uncertain offline completion. Doctor's confirmed completed-findings exit 1 is the only nonzero offline result that permits restarting a previously running app.
 
 ## Code style
 
@@ -154,7 +160,7 @@ docs/                   operations and Docker guides
 
 ## Out of scope
 
-Playback, streaming, transcoding of published files, online lookup or music recognition, two-way sync, filesystem watchers, users and roles, plugins, general history or undo, automatic merges, editing arbitrary tags, `move` imports, whole-library uploads from the browser, artist images, deletion of originals or a blob garbage collector, heuristic `feat.` parsing, replicas or multiple instances.
+Playback, streaming, transcoding of published files, online lookup or music recognition, two-way sync, filesystem watchers, users and roles, plugins, general history or undo, automatic merges, editing arbitrary tags, `move` imports, whole-library uploads from the browser, artist images, manual deletion or sweeping of retained originals, heuristic `feat.` parsing, replicas or multiple instances.
 
 ## How to work
 

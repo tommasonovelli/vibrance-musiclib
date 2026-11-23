@@ -159,6 +159,10 @@ func (h *handlers) trackOf(w nethttp.ResponseWriter, r *nethttp.Request, v catal
 // recorded size is the store's corruption (§11.3): 500, logged. The
 // Content-Type is always set, so ServeContent never sniffs.
 func (h *handlers) serve(w nethttp.ResponseWriter, r *nethttp.Request, d download) {
+	if err := h.api.failpoints.Hit("download_before_open"); err != nil {
+		h.api.fail(w, r, err)
+		return
+	}
 	f, err := h.blobs.Open(d.blob.Hash)
 	if err != nil {
 		h.api.fail(w, r, err)

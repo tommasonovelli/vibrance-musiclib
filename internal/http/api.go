@@ -34,6 +34,7 @@ import (
 	"musiclib/internal/fsops"
 	"musiclib/internal/importer"
 	"musiclib/internal/jobs"
+	"musiclib/internal/reclaim"
 	"musiclib/internal/store"
 )
 
@@ -58,8 +59,9 @@ type Config struct {
 	// request meets (store.IsFatal: a lost connection or an uncertain
 	// commit). §6.4: the process stops its mutations and its workers and
 	// restarts.
-	Fatal func(error)
-	Log   *slog.Logger
+	Fatal     func(error)
+	Admission *reclaim.Admission
+	Log       *slog.Logger
 	// Failpoints is nil in production. Tests set it to act at the named
 	// points of an upload: upload_waiting, before it waits for one of the
 	// MaxConcurrentUploads copy slots; upload_copying, once it holds one,
@@ -100,6 +102,7 @@ type API struct {
 	host          string
 	renderVersion string
 	fatal         func(error)
+	admission     *reclaim.Admission
 	fatalOnce     sync.Once
 	log           *slog.Logger
 	failpoints    failpoint.Hook
@@ -142,7 +145,7 @@ func New(cfg Config) (*API, error) {
 	if err := CheckPassword(cfg.Password); err != nil {
 		return nil, newError(0, CodeInvalidConfig, "the password %v", err)
 	}
-	a := &API{origin: cfg.PublicOrigin, host: u.Host, renderVersion: cfg.RenderVersion, fatal: cfg.Fatal, log: cfg.Log,
+	a := &API{origin: cfg.PublicOrigin, host: u.Host, renderVersion: cfg.RenderVersion, fatal: cfg.Fatal, admission: cfg.Admission, log: cfg.Log,
 		failpoints: cfg.Failpoints, uploads: make(chan struct{}, MaxConcurrentUploads),
 		password: sha256.Sum256([]byte(cfg.Password)), secure: u.Scheme == "https", signIns: make(chan struct{}, 1),
 		sessions: sessions{m: map[[sha256.Size]byte]time.Time{}}}
@@ -192,6 +195,14 @@ func (a *API) ServeHTTP(w nethttp.ResponseWriter, r *nethttp.Request) {
 		a.writeError(w, newError(nethttp.StatusServiceUnavailable, st.code, "%s", st.message))
 		return
 	}
+
+	release, err := a.admission.Enter(r.Context())
+	if err != nil {
+		closeCreationOnRefusal(w, r)
+		a.writeError(w, newError(nethttp.StatusServiceUnavailable, CodeShuttingDown, "originals admission is unavailable"))
+		return
+	}
+	defer release()
 	st.router.ServeHTTP(w, r)
 }
 
@@ -245,6 +256,7 @@ func (a *API) checkBoundary(r *nethttp.Request, form bool) *Error {
 func (a *API) fail(w nethttp.ResponseWriter, r *nethttp.Request, err error) {
 	e := translate(err)
 	if store.IsFatal(err) {
+		a.admission.Fence(err)
 		a.Disable(e.Code, e.Message)
 		a.fatalOnce.Do(func() {
 			a.log.Error("fatal database error in an API request", "code", e.Code, "method", r.Method,

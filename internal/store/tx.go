@@ -82,7 +82,19 @@ type CatalogTx struct {
 // other error is returned without a retry; a commit whose outcome is
 // unknown is CodeCommitUncertain, never retried (§6.4).
 func InCatalogTx(ctx context.Context, db *pgxpool.Pool, fn func(tx *CatalogTx) error) error {
-	return run(ctx, db, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}, func(q *Queries) error {
+	return inCatalogTx(ctx, db, false, fn)
+}
+
+// InCatalogTxBefore preserves the caller's deadline when committing or
+// rolling back. A deadline that interrupts COMMIT is still an uncertain
+// outcome. It lets a journaled operation leave recovery for the next start
+// if PostgreSQL stalls after an irreversible filesystem change.
+func InCatalogTxBefore(ctx context.Context, db *pgxpool.Pool, fn func(tx *CatalogTx) error) error {
+	return inCatalogTx(ctx, db, true, fn)
+}
+
+func inCatalogTx(ctx context.Context, db *pgxpool.Pool, keepDeadline bool, fn func(tx *CatalogTx) error) error {
+	return run(ctx, db, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}, keepDeadline, func(q *Queries) error {
 		if err := q.LockCatalog(ctx); err != nil {
 			return err
 		}
@@ -98,13 +110,13 @@ func InCatalogTx(ctx context.Context, db *pgxpool.Pool, fn func(tx *CatalogTx) e
 // in InCatalogTx; a concurrent update of a row that fn then locks is the
 // 40001 that makes the transaction run again.
 func InSnapshotTx(ctx context.Context, db *pgxpool.Pool, fn func(q *Queries) error) error {
-	return run(ctx, db, pgx.TxOptions{IsoLevel: pgx.RepeatableRead}, fn)
+	return run(ctx, db, pgx.TxOptions{IsoLevel: pgx.RepeatableRead}, false, fn)
 }
 
 // run is the retry loop shared by both kinds of transaction.
-func run(ctx context.Context, db *pgxpool.Pool, opts pgx.TxOptions, fn func(q *Queries) error) error {
+func run(ctx context.Context, db *pgxpool.Pool, opts pgx.TxOptions, keepDeadline bool, fn func(q *Queries) error) error {
 	for attempt := 0; ; attempt++ {
-		err := runOnce(ctx, db, opts, fn)
+		err := runOnce(ctx, db, opts, keepDeadline, fn)
 		if err == nil || !retryable(err) {
 			return err
 		}
@@ -119,7 +131,7 @@ func run(ctx context.Context, db *pgxpool.Pool, opts pgx.TxOptions, fn func(q *Q
 
 // runOnce is one transaction: begin, fn, commit, and the classification of
 // every failure (§6.4).
-func runOnce(ctx context.Context, db *pgxpool.Pool, opts pgx.TxOptions, fn func(q *Queries) error) error {
+func runOnce(ctx context.Context, db *pgxpool.Pool, opts pgx.TxOptions, keepDeadline bool, fn func(q *Queries) error) error {
 	tx, err := db.BeginTx(ctx, opts)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -127,12 +139,19 @@ func runOnce(ctx context.Context, db *pgxpool.Pool, opts pgx.TxOptions, fn func(
 		}
 		return &Error{Code: CodeConnectionLost, Msg: "beginning the transaction", Err: err}
 	}
-	if err := fn(New(tx)); err != nil {
-		return abort(ctx, tx, err)
+	err = fn(New(tx))
+	finishCtx := context.WithoutCancel(ctx)
+	if deadline, ok := ctx.Deadline(); keepDeadline && ok {
+		var cancel context.CancelFunc
+		finishCtx, cancel = context.WithDeadline(finishCtx, deadline)
+		defer cancel()
+	}
+	if err != nil {
+		return abort(ctx, finishCtx, tx, err)
 	}
 	// The commit runs to its end even if the caller is being cancelled: an
 	// interrupted commit is the uncertain outcome §6.4 wants to avoid.
-	err = tx.Commit(context.WithoutCancel(ctx))
+	err = tx.Commit(finishCtx)
 	if err == nil {
 		return nil
 	}
@@ -165,11 +184,11 @@ func runOnce(ctx context.Context, db *pgxpool.Pool, opts pgx.TxOptions, fn func(
 // that is gone makes the error fatal, whatever fn wrapped around it, unless
 // the caller's context ended first (cancellation also closes a connection
 // in the middle of a query).
-func abort(ctx context.Context, tx pgx.Tx, fnErr error) error {
+func abort(ctx, finishCtx context.Context, tx pgx.Tx, fnErr error) error {
 	// Read before the rollback: a pool transaction releases its connection
 	// inside Rollback, and another goroutine may acquire it at once.
 	closed := tx.Conn().IsClosed()
-	rbErr := tx.Rollback(context.WithoutCancel(ctx))
+	rbErr := tx.Rollback(finishCtx)
 	if ctx.Err() != nil {
 		return &Error{Code: CodeCanceled, Msg: "the transaction was interrupted", Err: errors.Join(fnErr, rbErr)}
 	}

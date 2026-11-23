@@ -15,6 +15,7 @@ import (
 	"musiclib/internal/catalog"
 	"musiclib/internal/jobs"
 	"musiclib/internal/media"
+	"musiclib/internal/store"
 )
 
 // The upload protocol of §10.2 (NOTES.md N-172, N-173): the body is the
@@ -175,6 +176,8 @@ func (h *handlers) putUpload(ctx context.Context, src io.Reader, limit int64) (b
 	switch {
 	case err == nil:
 		return b, nil
+	case store.IsFatal(err):
+		return blobstore.Blob{}, err
 	case errors.As(err, &e):
 		return blobstore.Blob{}, e
 	case errors.As(err, &mbe):

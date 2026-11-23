@@ -21,6 +21,9 @@ func Rebuild(ctx context.Context, db *pgxpool.Pool, v *volume.Volume, confirmed 
 	if confirmed == uuid.Nil || confirmed != v.StoreID() {
 		return refuse("rebuild_store_id", "the confirmed store id does not match the database and volume")
 	}
+	if err := requireNoOriginalRemoval(ctx, db); err != nil {
+		return err
+	}
 	if err := v.BeginMaintenance(volume.OpRebuild, confirmed); err != nil {
 		return err
 	}

@@ -97,6 +97,13 @@ func (a *API) Pages(w http.ResponseWriter, r *http.Request) {
 		a.writeError(w, newError(http.StatusServiceUnavailable, st.code, "%s", st.message))
 		return
 	}
+
+	release, err := a.admission.Enter(r.Context())
+	if err != nil {
+		a.writeError(w, newError(http.StatusServiceUnavailable, CodeShuttingDown, "originals admission is unavailable"))
+		return
+	}
+	defer release()
 	b := st.backend
 	if b.Catalog == nil {
 		a.writeError(w, newError(http.StatusServiceUnavailable, CodeNotReady, "catalog unavailable"))

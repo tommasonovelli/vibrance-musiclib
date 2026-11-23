@@ -116,6 +116,9 @@ func Restore(ctx context.Context, db *pgxpool.Pool, v *volume.Volume, from, dbUR
 	if err := store.Migrate(ctx, db); err != nil {
 		return fail("restore_migrate", "cannot apply forward migrations to the restored catalog", err)
 	}
+	if err := requireNoOriginalRemoval(ctx, db); err != nil {
+		return fail("restore_original_removal_pending", "restored catalog has an unverified removal state", err)
+	}
 	id, err := store.New(db).GetStoreID(ctx)
 	if err != nil || id != m.StoreID {
 		return fail("restore_store_id", "restored settings.store_id differs from manifest", err)
@@ -134,7 +137,7 @@ func Restore(ctx context.Context, db *pgxpool.Pool, v *volume.Volume, from, dbUR
 	for _, b := range catalogBlobs {
 		if size, ok := inventory[b.Hash]; ok && size != b.Size {
 			return fail("restore_catalog_blob_size", "catalog size differs for "+b.Hash, nil)
-		} else if b.Referenced != nil && *b.Referenced && !ok {
+		} else if b.Referenced && !ok {
 			return fail("restore_catalog_blob_missing", "referenced original is absent: "+b.Hash, nil)
 		}
 	}

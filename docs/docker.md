@@ -82,6 +82,8 @@ scripts/check.sh ./internal/names ./internal/fsops
 
 The `test` container has no internet (its only network is the internal `testdb`, shared with `postgres-test`), a read-only root filesystem, no capabilities, and runs as your uid. Go modules come from the image layer, downloaded and verified against `go.sum` when `go.mod` or `go.sum` change. It sets `MUSICLIB_REQUIRE_DB=1` and `MUSICLIB_REQUIRE_FULLFS=1`, so the PostgreSQL tests and the full-disk tests fail instead of skipping: the gate can never pass without running them. A host `go test`, which skips them, proves nothing.
 
+Original reclamation tests use synthetic originals in the ext4 test volume. They exercise the real PostgreSQL journal, confined unlink and directory sync. Application `SIGKILL` covers process replay with the kernel still running. An ordering test wraps the real shard directory to check that the unlink, a successful directory fsync and a checked close come before finalization; it shows that the calls happen, not that the device kept them. A native storage failure test is needed to reproduce a lost unsynced directory update.
+
 ### scripts/dev.sh: the toolchain on the live sources
 
 ```text

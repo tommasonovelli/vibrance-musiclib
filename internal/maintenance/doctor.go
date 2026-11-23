@@ -18,6 +18,7 @@ import (
 	"musiclib/internal/catalog"
 	"musiclib/internal/fsops"
 	"musiclib/internal/names"
+	"musiclib/internal/reclaim"
 	"musiclib/internal/render"
 	"musiclib/internal/store"
 	"musiclib/internal/volume"
@@ -57,6 +58,22 @@ func Doctor(ctx context.Context, db *pgxpool.Pool, v *volume.Volume, deep bool) 
 		return r, fmt.Errorf("doctor requires an identified store")
 	}
 	q := store.New(db)
+	armed, err := reclaim.InspectArmed(ctx, q, storeID, v.Originals(), deep)
+	if err != nil {
+		return r, fmt.Errorf("inspect original removal intent: %w", err)
+	}
+	removal := armed.Hash
+	switch {
+	case removal == "":
+	case armed.Problem != "":
+		r.add("error", "doctor_original_removal_unreplayable", removal,
+			"Startup cannot finish this removal: "+armed.Problem+". Keep the app stopped and this installation unchanged; recover from a known-good earlier backup into a new empty installation.")
+	case deep:
+		r.add("warning", "doctor_original_removal_pending", removal, "Start the app to finish this original removal.")
+	default:
+		r.add("warning", "doctor_original_removal_pending", removal,
+			"Start the app to finish this original removal. If startup fails with original_removal_unsafe, stop the app and run doctor --deep; do not keep restarting it.")
+	}
 	issues, err := q.DoctorStructuralIssues(ctx)
 	if err != nil {
 		return r, fmt.Errorf("read structural inventory: %w", err)
@@ -201,25 +218,29 @@ func Doctor(ctx context.Context, db *pgxpool.Pool, v *volume.Volume, deep bool) 
 		r.add("error", "doctor_claim_missing", id.String()+":"+key, "Rebuild reservations with an explicit rebuild.")
 	}
 	bs := blobstore.OpenReadOnly(v.Originals())
-	knownBlobs := make(map[string]bool, len(blobs)) // hash -> referenced
+	// hash -> checked here; the walk below verifies only the others.
+	knownBlobs := make(map[string]bool, len(blobs))
 	for _, b := range blobs {
 		if err := ctx.Err(); err != nil {
 			return r, err
 		}
-		knownBlobs[b.Hash] = knownBlobReferenced(b.Referenced)
-		if b.Referenced == nil || !*b.Referenced {
-			r.add("info", "doctor_unreferenced_blob", b.Hash, "Keep this original; no automatic garbage collection is performed.")
-		}
-		if !knownBlobReferenced(b.Referenced) {
-			continue // absence of an unreferenced blob is not catalog damage
-		}
-		if err := bs.Check(blobstore.Blob{SHA256: b.Hash, Size: b.Size}); err != nil {
-			r.add("error", "doctor_blob_damaged", b.Hash, "Recover a good original from backup; rendering cannot repair an original.")
-		} else if deep {
-			n, err := bs.Verify(ctx, b.Hash)
-			if err != nil || n != b.Size {
-				r.add("error", "doctor_blob_hash", b.Hash, "Recover a good original from backup; rendering cannot repair an original.")
+		knownBlobs[b.Hash] = b.Referenced || b.ReclamationPending || b.Hash == removal
+		switch {
+		case b.Hash == removal:
+			continue // inspected with the intent above
+		case b.Referenced:
+			if err := bs.Check(blobstore.Blob{SHA256: b.Hash, Size: b.Size}); err != nil {
+				r.add("error", "doctor_blob_damaged", b.Hash, "Recover a good original from backup; rendering cannot repair an original.")
+			} else if deep {
+				n, err := bs.Verify(ctx, b.Hash)
+				if err != nil || n != b.Size {
+					r.add("error", "doctor_blob_hash", b.Hash, "Recover a good original from backup; rendering cannot repair an original.")
+				}
 			}
+		case !b.ReclamationPending:
+			r.add("info", "doctor_unreferenced_blob", b.Hash, "Keep this retained original.")
+		default:
+			r.add(eligibleFinding(ctx, bs, blobstore.Blob{SHA256: b.Hash, Size: b.Size}, deep))
 		}
 	}
 	if err := walk(ctx, v.Originals(), "", func(rel string, t fsops.FileType) {
@@ -230,13 +251,14 @@ func Doctor(ctx context.Context, db *pgxpool.Pool, v *volume.Volume, deep bool) 
 		if len(parts) != 3 || len(parts[0]) != 2 || len(parts[1]) != 2 || !strings.HasPrefix(parts[2], parts[0]+parts[1]) || blobstore.ValidateSHA(parts[2]) != nil || t != fsops.TypeRegular {
 			r.add("warning", "doctor_originals_extra", rel, "Inspect this unexpected originals entry; doctor never deletes originals.")
 		} else if _, inCatalog := knownBlobs[parts[2]]; !inCatalog {
-			r.add("info", "doctor_unreferenced_blob", parts[2], "Keep this unreferenced original; no automatic garbage collection is performed.")
+			r.add("info", "doctor_unreferenced_blob", parts[2], "Keep this retained original.")
 			if deep {
 				if _, err := bs.Verify(ctx, parts[2]); err != nil {
 					r.add("error", "doctor_blob_hash", parts[2], "Recover a good original from backup.")
 				}
 			}
 		} else if deep && !knownBlobs[parts[2]] {
+			// A retained registered original that nothing references.
 			if _, err := bs.Verify(ctx, parts[2]); err != nil {
 				r.add("error", "doctor_blob_hash", parts[2], "Recover a good original from backup.")
 			}
@@ -271,7 +293,27 @@ func Doctor(ctx context.Context, db *pgxpool.Pool, v *volume.Volume, deep bool) 
 	return r, ctx.Err()
 }
 
-func knownBlobReferenced(b *bool) bool { return b != nil && *b }
+// eligibleFinding classifies an unreferenced original that waits for
+// background removal with the collector's own read-only preflight. In a
+// verified shard, a missing name or a regular file of another size or
+// content is kept and skipped by the server; anything else stops it. Only
+// deep finds a same-size content change.
+func eligibleFinding(ctx context.Context, bs *blobstore.Store, b blobstore.Blob, deep bool) (string, string, string, string) {
+	err := bs.CheckRemoval(ctx, b, deep)
+	if err == nil || ctx.Err() != nil {
+		return "info", "doctor_original_reclamation_eligible", b.SHA256, "The server will reclaim this original after its last use."
+	}
+	if refusal, ok := err.(*blobstore.Refusal); ok && refusal.Reason == blobstore.RefusedMissing {
+		return "error", "doctor_original_reclamation_missing", b.SHA256,
+			"This original, which nothing references, is missing from its folder. The app keeps its record and skips it; adding the same content is refused while it waits. Never create, copy or delete files in originals/."
+	}
+	if _, ok := err.(*blobstore.Refusal); ok {
+		return "error", "doctor_original_reclamation_damaged", b.SHA256,
+			"This original, which nothing references, is damaged. The app keeps and skips it; backups fail until you recover from a known-good earlier backup into a new empty installation."
+	}
+	return "error", "doctor_original_reclamation_unsafe", b.SHA256,
+		"The app cannot check this original safely (a missing or unsafe folder, an unexpected entry or a read error) and stops with original_removal_unsafe when it tries to remove it. Keep the app stopped and change nothing in originals/; recover from a known-good earlier backup into a new empty installation."
+}
 
 func markParents(dirs map[string]bool, path string) {
 	for index := strings.LastIndexByte(path, '/'); index > 0; index = strings.LastIndexByte(path[:index], '/') {

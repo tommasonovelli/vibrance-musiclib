@@ -235,7 +235,7 @@ Inside the container the paths are fixed: `/data` (the data folder), `/import` (
 /data/.lock              the lock that keeps a second MusicLib off this folder: empty, never removed
 /data/.musiclib-store    store_id=<uuid>: pairs the folder with its database (written once, read-only)
 /data/.maintenance       only while a rebuild or restore runs: blocks the start until it completes
-/data/originals/         the originals, named by their SHA-256: never changed
+/data/originals/         immutable original copies, named by their SHA-256
 /data/library/           the generated library: output only
 /data/work/              temporary builds and files
 ```
@@ -286,7 +286,7 @@ MusicLib still reads canonical schema 1 receipts, which have no store or track p
 - Plan for about **twice the size of the music you import**: one copy for the originals and one for the library, plus room for work in progress and at least 1 GiB free.
 - Every import, album update and upload first reserves its estimated size, and starts only if the free space of the data folder, minus a 1 GiB safety margin and every other reservation, covers it. Otherwise it fails with `insufficient_space` (an upload answers `507`). A disk can still fill up during a write: then the published album and the originals stay intact. Free some space and retry.
 - Each backup needs about the size of the originals again, plus the database dump, on the backup disk.
-- MusicLib never deletes an original: trashing an album, emptying the trash or deleting a track frees no space. Never delete originals to make room.
+- After a file loses its last catalog reference, MusicLib frees its original copy in the background once active uses finish. Trashed albums still hold their files until you empty the trash. References from other albums or fields keep a shared file. Old unreferenced copies and files left by a failed upload that never became referenced stay in the store. Removal waits while MusicLib is in use, such as during a download, an upload or a render. A copy found missing or damaged before removal is kept: see [If original reclamation reports a problem](#if-original-reclamation-reports-a-problem). Never edit or remove files from `originals/` by hand.
 
 ### The data in a host folder
 
@@ -663,7 +663,7 @@ Stopping the request or losing the reply does not prove that the save failed. Th
 - If two browser tabs edit the same album, the second save is refused instead of overwriting the first: reload the page and redo the change. Moving tracks into an album changes it too: a tab still open on it must reload before saving.
 - **Needs attention**, in the sidebar, lists the albums whose last library update failed. On the album's page, **Update in library** tries again.
 - **Trash.** Moving an album to the trash removes it from the library folder; you can restore it from the **Trash** page until you empty the trash. Its originals stay.
-- **Empty trash**, on the **Trash** page, deletes the albums in the trash for good: their names, tracks, cover choice and extra files leave the catalog. Nothing is deleted automatically, only when you empty the trash. The original files stay in MusicLib (it never deletes one), so no disk space is freed. An album can come back only by importing its folder again (it is no longer skipped as already imported) or by restoring a backup made before. An artist left without albums goes with its last one. The import reports keep their folders, without a link to the album. An album whose removal from the library folder is still waiting, running or failed stays in the trash: the page says how many, and you empty the trash again once Activity is done.
+- **Empty trash**, on the **Trash** page, deletes the albums in the trash for good: their names, tracks, cover choice and extra files leave the catalog. Albums stay in the trash until you empty it. MusicLib reclaims each original copy after its last catalog reference and active use have ended. An album can come back only by importing its folder again (it is no longer skipped as already imported) or by restoring a backup made before. An artist left without albums goes with its last one. The import reports keep their folders, without a link to the album. An album whose removal from the library folder is still waiting, running or failed stays in the trash: the page says how many, and you empty the trash again once Activity is done.
 - Uploads: a track up to 2 GiB, a cover up to 20 MiB (JPEG or PNG, 40 megapixels), an extra file up to 256 MiB, lyrics (LRC) up to 2 MiB. At most two uploads copy at once; a third waits for its turn.
 
 ## Backups, restore and moving
@@ -707,7 +707,7 @@ A restore puts a backup into a **new, empty installation**: a new, empty databas
 
 If the command reports that the catalog and originals are restored but the app could not become ready, troubleshoot startup; **do not restore again into the now-populated destinations**. Releases without `musiclib` can use the [manual procedure](#manual-backup-and-restore).
 
-Restore preserves the backup's store, album and track IDs and all original bytes, including unreferenced originals. It resets publication state and regenerates the library with the restoring version's renderer. Two restores of the same backup share lineage even if they later diverge: keep their databases and data mounts separate; a matching store ID does not make them interchangeable. Keep the backup unchanged during the restore: a change between its verification and the database restore can leave the destinations unusable.
+Restore preserves the backup's store, album and track IDs and all original bytes, including unreferenced originals. It resets publication state and regenerates the library with the restoring version's renderer. It also starts a fresh removal history from the restored catalog references. Unreferenced files in the backup are kept. Two restores of the same backup share lineage even if they later diverge: keep their databases and data mounts separate; a matching store ID does not make them interchangeable. Keep the backup unchanged during the restore: a change between its verification and the database restore can leave the destinations unusable.
 
 **If the restore fails**, its exit code and log line say which case you are in:
 
@@ -862,7 +862,7 @@ Use `./musiclib --help` for the four offline commands. [Backup and restore](#bac
 - Without `--deep`, doctor checks that every original and every library file exists with its expected size, the path reservations, the receipts and the expected output. It is quick.
 - With `--deep`, it also reads every original and every file listed in the receipts (tracks, covers, extra files) and compares its hash. A file changed without a change of size or date is found only this way. It takes time: it reads the whole data folder.
 - Each finding is one line: severity (`error`, `warning` or `info`), code, the path or id it concerns, and advice, such as `warning doctor_output_extra Miles Davis/Kind of Blue/Thumbs.db: This output file is not in a DB-anchored receipt; inspect it before rebuilding.` Only `error` findings are damage. The last line is `Doctor complete: no damage found. Nothing was changed.` (exit 0) or `Doctor found damaged or inconsistent data. Nothing was changed.` (exit 1).
-- **Doctor never repairs, never deletes and never resolves a pending publication.** An extra file is reported, not deleted. Unreferenced originals are information: do **not** delete them. A pending publication is reported: start the app to complete it, or use `rebuild`.
+- **Doctor reports problems without repairs.** Keep unreferenced originals in place. Start the app to complete a pending publication, or use `rebuild`. Backup and rebuild refuse to run while a removal is armed (`doctor_original_removal_pending`). Without `--deep`, doctor cannot see a damaged original of the same size: an armed removal it reports as pending can still fail at startup. For the reclamation findings, see [If original reclamation reports a problem](#if-original-reclamation-reports-a-problem).
 - Damaged originals need a good copy from a backup: a render or a rebuild only regenerates the library.
 
 What each finding means: [Errors of the maintenance commands](#errors-of-the-maintenance-commands).
@@ -972,7 +972,7 @@ Each step logs a line, in this order; a refusal stops at its step:
 3. If `/data/.maintenance` exists, the start stops with `volume_maintenance_pending` (or `_malformed`), before touching the database.
 4. `database not reachable yet` (retried, from 250 ms to 5 s apart) until `database reachable`; then the database migrations.
 5. `volume identified`: `/data/.musiclib-store` and the database must name the same store. Only a new, empty data folder with a new database is initialized: the first start creates both.
-6. `originals/`, `library/` and `work/` are created if missing. Then the checks: one filesystem and one mount for all of `/data`, read and write permission, a real `RENAME_EXCHANGE` in `work/`; `media tools verified`: ffmpeg, ffprobe and the tag helper at their pinned versions (the line lists `ffmpeg`, `ffprobe`, `musiclib_tags` and `taglib`); `/import` readable and not part of `/data`.
+6. `originals/`, `library/` and `work/` are created if missing. Then the checks: one filesystem and one mount for all of `/data`, read and write permission, a real `RENAME_EXCHANGE` in `work/`. An original removal armed by an earlier run is finished here; if its journal and the file do not match a step that can be completed safely, the start stops with `original_removal_unsafe` and changes nothing. Then `media tools verified`: ffmpeg, ffprobe and the tag helper at their pinned versions (the line lists `ffmpeg`, `ffprobe`, `musiclib_tags` and `taglib`); `/import` readable and not part of `/data`.
 7. `journal recovered` (or `no pending publication`): a publication that a crash, a lost database or an error left half done is completed forward before anything else. If the disk matches no legal step of it, publishing is **suspended** (`publish_illegal_state`, see below).
 8. `work cleaned`: leftovers of an interrupted run are removed from `work/`; `running jobs recovered`: work of the previous run goes back to waiting.
 9. `stale renders enqueued`: every active album rendered by another version of the renderer, and without a job, gets a new render. A failed render stays failed.
@@ -1007,8 +1007,27 @@ The process exits with 2 for the first three codes and 1 for the others, except 
 | `media_tool_unavailable`, `media_tool_version` | ffmpeg, ffprobe or the tag helper is missing, broken or not the pinned version | pull the image again (`docker compose pull app`), or rebuild a source build (`docker compose -f compose.dev.yaml build app`); never replace the tools by hand |
 | `store_migrate`, `store_schema_too_new` | the migrations failed, or the database is newer than this version | read the message; never downgrade: restore a backup made by this version instead |
 | `publish_illegal_state` (keeps running, unhealthy, no work) | the pending publication does not match what is on disk (a folder moved or created by hand in `library/` or `work/`, a missing build); nothing was deleted; `/health/ready` answers 503 with the album and the build | put back what was moved and run `docker compose restart app` (the recovery runs again), or stop the app and run [rebuild](#rebuild-regenerate-the-library-folder) |
+| `original_removal_unsafe` | an original removal cannot be done safely: at startup, an armed removal does not match its file or the catalog; while running, an original waiting for removal has a missing or unsafe folder, an unexpected entry or a read error; nothing was changed | stop the app so that it does not keep restarting, then follow [If original reclamation reports a problem](#if-original-reclamation-reports-a-problem) |
 | `publish_io` | a filesystem error (I/O error, full disk, permission) while completing the pending publication | fix the disk, the space or the owner; the next start retries |
 | `store_connection_lost`, `store_commit_uncertain` (while running) | the database was lost, or a commit's outcome is unknown | nothing: Docker restarts MusicLib, which recovers. If it repeats, check PostgreSQL: `docker compose logs --tail=50 postgres` |
+
+### If original reclamation reports a problem
+
+MusicLib removes an original only after its last catalog reference is gone, and only once it has verified the file. It never repairs, recreates or deletes a file it cannot verify. There are three cases.
+
+**A copy is missing or damaged before removal.** Its folder in `originals/` is intact, but the file itself is missing, or is an ordinary file of another size or content. The log shows a warning with `"code":"original_reclamation_deferred"`, the hash and the reason (`original_missing` or `original_mismatch`). The app keeps running, skips that original until its next start and continues with the others; the warning repeats once after each start. Doctor reports `doctor_original_reclamation_missing` or `doctor_original_reclamation_damaged` (a change that kept the size is seen only with `--deep`). Nothing in the catalog uses that original, so no album is affected, and nothing needs to be done for the app to keep working. While it waits for removal, importing or uploading a file with the same content is refused; a restore into a new installation starts a fresh removal history, which ends that wait. A damaged copy also makes backups fail (`backup_corrupt_blob`); to get working backups again, recover from a known-good earlier backup as in steps 4 and 5 below, which loses the changes made after that backup. Never copy, replace or delete files in `originals/` by hand.
+
+**An original waiting for removal cannot be checked safely.** Its folder in `originals/` is missing or is not a plain folder, its name is a link, a folder or another unexpected entry, or it cannot be read. The running app stops with `original_removal_unsafe` before changing anything, and it stops again soon after each restart. Stop the app as in step 1 below and run `./musiclib doctor`, which reports `doctor_original_reclamation_unsafe`. Do not edit the database or change anything in `originals/`. Then recover as in steps 4 and 5 below.
+
+**An armed removal cannot be finished.** The app refuses to start with `original_removal_unsafe`, and restarting does not help:
+
+1. Stop the app so that Docker stops restarting it: `docker compose stop app`.
+2. Run `./musiclib doctor --deep`. `doctor_original_removal_unreplayable` names the hash and the reason. Without `--deep`, a same-size damaged original appears only as `doctor_original_removal_pending`.
+3. Do not edit the database, clear the journal, delete or replace the original, or retry startup in a loop. Backup and rebuild refuse to run (`original_removal_pending`). Keep this installation, its database and its data folder unchanged for investigation.
+4. Recover from a **known-good earlier backup** into a **new empty installation**, as in [Restore: use new empty destinations](#restore-use-new-empty-destinations) or [Restoring next to an existing installation](#restoring-next-to-an-existing-installation). Changes made after that backup are not recovered. Restore refuses an archive that contains an armed removal (`restore_original_removal_pending`); then create new empty destinations again and use an earlier backup. The restored installation starts a fresh removal history.
+5. When the new installation works and has its own backup, decide what to do with the old one. Do not reuse its database or data folder.
+
+If there is no earlier backup, this procedure cannot recover the changes. Stop here and get help. Do not improvise with SQL or files in `originals/`.
 
 ### Errors of the maintenance commands
 
@@ -1036,7 +1055,13 @@ Each code appears in the command's log line, with an `advice` field for failures
 | `doctor_output_type`, `doctor_output_extra`, `doctor_originals_extra`, `doctor_unreadable` | an unexpected or unreadable entry | inspect the named path by hand; doctor never follows symbolic links and never deletes |
 | `doctor_claim_invalid`, `doctor_claim_missing`, `doctor_claim_collision`, `doctor_invalid_path`, `doctor_published_state`, `doctor_album_no_tracks`, `doctor_missing_blob`, `doctor_missing_album` | the catalog is inconsistent | keep the app stopped, back up the evidence and investigate; rebuild resets reservations and publication state only |
 | `doctor_blob_damaged`, `doctor_blob_hash` | an original is damaged | restore a good copy of it from a backup; rebuild cannot fix it |
-| `doctor_pending_work`, `doctor_journal_pending`, `doctor_unreferenced_blob` | not damage | start the app to finish the work or the publication, or use rebuild for a stuck publication; keep unreferenced originals |
+| `doctor_pending_work`, `doctor_journal_pending` | work or publication is pending | start the app to finish it, or use rebuild for a stuck publication |
+| `doctor_unreferenced_blob`, `doctor_original_reclamation_eligible` | a retained original or an original eligible for background removal | keep files in place and let the app handle eligible originals |
+| `doctor_original_reclamation_missing`, `doctor_original_reclamation_damaged` | an original that nothing references is missing from its intact folder, or is a file of another size or content; the app keeps it and skips its removal | see [If original reclamation reports a problem](#if-original-reclamation-reports-a-problem) |
+| `doctor_original_reclamation_unsafe` | an original that nothing references cannot be checked safely (a missing or unsafe folder, an unexpected entry or a read error); the app stops with `original_removal_unsafe` when it tries to remove it | keep the app stopped and see [If original reclamation reports a problem](#if-original-reclamation-reports-a-problem) |
+| `doctor_original_removal_pending`, `original_removal_pending` (exit 2) | an original removal was armed; backup and rebuild refuse | start the app to finish it. If startup fails with `original_removal_unsafe`, see [If original reclamation reports a problem](#if-original-reclamation-reports-a-problem) |
+| `restore_original_removal_pending` (exit 1) | the backup contains an armed original removal; no original was installed, and `.maintenance` blocks the start | keep that backup unchanged; create **both** new empty destinations and restore an earlier backup |
+| `doctor_original_removal_unreplayable`, `original_removal_unsafe` | an armed removal cannot be finished safely | see [If original reclamation reports a problem](#if-original-reclamation-reports-a-problem); keep the original and the journal in place |
 | `doctor_failed` (exit 1) | the check could not complete (I/O or database error); nothing was changed | fix the cause and run it again |
 
 ## The API
@@ -1095,7 +1120,7 @@ curl -s -b "$J" -X POST "$O/api/trash/empty" -H 'X-Musiclib-Request: 1'         
 
 - **Saving an album** (`PUT /api/albums/<id>`) takes every key of `{artist_id, new_artist, title, year, genre, compilation, tracks}`. The album's artist is exactly one of `artist_id` (an existing artist) and `new_artist` (the name of an artist to create with this save, in the same transaction); the other is `null`. A save that fails (428, 412, 422, 409) creates nothing; a `new_artist` that already exists is `409 artist_exists` (or `artist_folder_conflict`) with the existing artist's `artist_id` and both names in `details`.
 - An artist left without any album, trashed ones included, by a save that moves its last album elsewhere is deleted by that save. `POST /api/artists` creates an artist without an album; it stays until an album arrives and leaves it.
-- **Emptying the trash** (`POST /api/trash/empty`, no body, no `If-Match`) deletes from the catalog every trashed album whose removal from the library folder is complete, and answers `200` with how many were `deleted` and how many are `waiting` (their removal is still queued, running or failed). The originals stay; a deleted album answers `404 album_not_found`, and its import jobs keep their report with `result_album_id` `null`.
+- **Emptying the trash** (`POST /api/trash/empty`, no body, no `If-Match`) deletes from the catalog every trashed album whose removal from the library folder is complete, and answers `200` with how many were `deleted` and how many are `waiting` (their removal is still queued, running or failed). Any original that loses its last reference becomes eligible for background removal. A deleted album answers `404 album_not_found`, and its import jobs keep their report with `result_album_id` `null`.
 - Each track of `GET /api/albums/<id>` carries `duration_ms`, its duration in milliseconds, or `null` while unknown: read-only, not a field of the PUT body.
 
 ### Creating an album

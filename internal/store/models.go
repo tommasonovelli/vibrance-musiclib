@@ -77,6 +77,23 @@ type Job struct {
 	DismissedAt   *time.Time
 }
 
+type OriginalReclamation struct {
+	Hash       string
+	Generation *int64
+}
+
+type OriginalReference struct {
+	Hash string
+}
+
+type OriginalRemoval struct {
+	Singleton  bool
+	StoreID    uuid.UUID
+	Hash       string
+	Size       int64
+	Generation int64
+}
+
 type PathClaim struct {
 	PathKey string
 	Path    string

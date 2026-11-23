@@ -46,7 +46,10 @@ func (p *Publisher) ExecuteRender(ctx context.Context, c *jobs.Claim) error {
 	// The staging holds its space until it is installed or discarded
 	// (§11.2, N-114); both are over when Publish returns.
 	defer res.Space.Release()
-	p.recordDurations(ctx, c.Attempt, res.Durations)
+	if err := p.recordDurations(ctx, c.Attempt, res.Durations); err != nil {
+		// Shutdown joins the worker and boot cleans the unjournaled build.
+		return err
+	}
 	rep, err := p.Publish(ctx, snap, res)
 	if err != nil {
 		if jobs.Stops(err) {
@@ -60,21 +63,23 @@ func (p *Publisher) ExecuteRender(ctx context.Context, c *jobs.Claim) error {
 }
 
 // recordDurations records the track durations the build read for blobs
-// whose duration the catalog did not know (NOTES.md N-301), in a short
-// catalog transaction of its own, before the publication. They are
-// informational: a failure is logged and the render goes on, since neither
-// the publication nor the job's outcome depends on them (a database that
-// is really gone stops the render at PREPARE, as before).
-func (p *Publisher) recordDurations(ctx context.Context, a jobs.Attempt, durations map[string]int64) {
+// whose duration the catalog did not know before publication. A failed
+// informational update is logged. A fatal transaction error stops the
+// worker so that it fences originals admission before releasing it.
+func (p *Publisher) recordDurations(ctx context.Context, a jobs.Attempt, durations map[string]int64) error {
 	if len(durations) == 0 {
-		return
+		return nil
 	}
 	err := store.InCatalogTx(ctx, p.db, func(tx *store.CatalogTx) error {
 		return catalog.RecordDurations(ctx, tx, durations)
 	})
+	if store.IsFatal(err) {
+		return err
+	}
 	if err != nil {
 		p.log.Warn("the track durations were not recorded", "job_id", a.JobID, "error", err.Error())
 	}
+	return nil
 }
 
 // failBeforeJournal completes a render that failed before PREPARE (§6.4):

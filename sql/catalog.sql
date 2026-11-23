@@ -11,11 +11,10 @@ SELECT pg_advisory_xact_lock(7884786317834415207);
 -- originals still belong to the catalog. The list includes unreferenced rows
 -- so doctor can distinguish them from missing files and orphaned files.
 -- name: DoctorBlobs :many
-SELECT b.hash, b.size, EXISTS (
-    SELECT 1 FROM tracks t WHERE t.blob_hash = b.hash OR t.lyrics_hash = b.hash
-) OR EXISTS (SELECT 1 FROM attachments a WHERE a.blob_hash = b.hash)
-  OR EXISTS (SELECT 1 FROM albums al WHERE al.cover_hash = b.hash) AS referenced
-FROM blobs b ORDER BY b.hash;
+SELECT b.hash, b.size,
+    EXISTS (SELECT FROM original_references ref WHERE ref.hash = b.hash) AS referenced,
+    (r.generation IS NOT NULL)::boolean AS reclamation_pending
+FROM blobs b LEFT JOIN original_reclamation r USING (hash) ORDER BY b.hash;
 
 -- name: DoctorAlbums :many
 SELECT al.id, ar.name AS artist_name, al.title,

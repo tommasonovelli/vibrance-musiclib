@@ -19,6 +19,7 @@ import (
 	"musiclib/internal/jobs"
 	"musiclib/internal/media"
 	"musiclib/internal/publish"
+	"musiclib/internal/reclaim"
 	"musiclib/internal/render"
 	"musiclib/internal/store"
 	"musiclib/internal/volume"
@@ -50,13 +51,15 @@ type daemon struct {
 	srvErr chan error // the error of srv.Serve, if it stops by itself
 
 	// api serves /api from step 1: 503 until the end of the boot, then
-	// the catalog (§10). apiFatal receives the first fatal database error
-	// an API request met (§6.4), which ends the run like the pool's.
-	api      *apihttp.API
-	apiFatal chan error
+	// the catalog.
+	api *apihttp.API
 
-	vol  *volume.Volume
-	pool *pgxpool.Pool
+	vol           *volume.Volume
+	pool          *pgxpool.Pool
+	admission     *reclaim.Admission
+	collector     *reclaim.Collector
+	stopCollector context.CancelFunc
+	collectorDone chan struct{}
 
 	// runner is the one Runner of the process: every native tool runs
 	// through it, bounded by WORKERS (§6.1). tools are the verified ffmpeg,
@@ -95,11 +98,16 @@ type daemon struct {
 func run(ctx context.Context, cfg Config, p paths, ln net.Listener, log *slog.Logger) (err error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	d := &daemon{cfg: cfg, paths: p, log: log, srvErr: make(chan error, 1), apiFatal: make(chan error, 1)}
+	d := &daemon{cfg: cfg, paths: p, log: log, srvErr: make(chan error, 1), admission: reclaim.NewAdmission()}
 	if err := d.startHTTP(ln, cancel); err != nil {
 		return err
 	}
-	defer func() { err = errors.Join(err, d.shutdown()) }()
+	defer func() {
+		err = errors.Join(err, d.shutdown())
+		if fatal := d.admission.Err(); fatal != nil && !errors.Is(err, fatal) {
+			err = errors.Join(err, fatal)
+		}
+	}()
 
 	if err := d.boot(ctx); err != nil {
 		if errors.Is(err, errPublishingSuspended) {
@@ -118,7 +126,9 @@ func run(ctx context.Context, cfg Config, p paths, ln net.Listener, log *slog.Lo
 	for {
 		select {
 		case <-ctx.Done():
-			return d.serveErr()
+			return errors.Join(d.serveErr(), d.admission.Err())
+		case <-d.admission.Failed():
+			return d.admission.Err()
 		case <-purge.C:
 			// §6.4 retention, once a day while the server runs (N-200).
 			if err := d.purgeReports(ctx); err != nil {
@@ -128,12 +138,6 @@ func run(ctx context.Context, cfg Config, p paths, ln net.Listener, log *slog.Lo
 				}
 				log.Warn("purging the import reports failed; retried in a day", "code", codeOf(err), "error", err.Error())
 			}
-		case err := <-d.apiFatal:
-			// §6.4: an API request lost the database or could not learn the
-			// outcome of its commit. The process exits non-zero so that
-			// Docker restarts it.
-			log.Error("fatal failure in an API request, stopping", "code", codeOf(err))
-			return err
 		case err := <-d.poolDone:
 			// Cancellation and a clean worker exit can become ready in the
 			// same select: shutdown wins, rather than reporting an ordinary
@@ -150,6 +154,9 @@ func run(ctx context.Context, cfg Config, p paths, ln net.Listener, log *slog.Lo
 			// error a second time.
 			d.poolDone = make(chan error, 1)
 			d.poolDone <- nil
+			if err == nil {
+				err = d.admission.Err()
+			}
 			if err == nil {
 				err = &bootError{code: codeWorkers, msg: "the worker pool stopped by itself"}
 			}
@@ -187,6 +194,10 @@ func (d *daemon) boot(ctx context.Context) error {
 		return err
 	}
 	if err := d.vol.CheckFilesystem(); err != nil {
+		return err
+	}
+	d.collector = reclaim.New(d.pool, d.vol.StoreID(), d.vol.Originals(), d.admission, d.log, nil)
+	if err := d.collector.Recover(ctx); err != nil {
 		return err
 	}
 	if err := d.checkTools(ctx); err != nil {
@@ -238,6 +249,13 @@ func (d *daemon) boot(ctx context.Context) error {
 		Tracks: d.importer, Creation: d.importer})
 	d.log.Info("ready", "store_id", d.vol.StoreID().String())
 	d.ready.Store(d.pool)
+	collectCtx, stop := context.WithCancel(ctx)
+	d.stopCollector = stop
+	d.collectorDone = make(chan struct{})
+	go func() {
+		defer close(d.collectorDone)
+		d.collector.Run(collectCtx)
+	}()
 	return nil
 }
 
@@ -374,7 +392,17 @@ func (d *daemon) buildCatalog() error {
 // outcomes are older than catalog.ReportRetentionDays, and that have no
 // job left to run, are deleted with their jobs (N-200). It runs at boot
 // and then once a day (run).
-func (d *daemon) purgeReports(ctx context.Context) error {
+func (d *daemon) purgeReports(ctx context.Context) (err error) {
+	release, err := d.admission.Enter(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if store.IsFatal(err) {
+			d.admission.Fence(err)
+		}
+		release()
+	}()
 	n, err := d.catalog.PurgeImportReports(ctx)
 	if err != nil {
 		return err
@@ -421,6 +449,7 @@ func (d *daemon) startHTTP(ln net.Listener, cancel context.CancelFunc) error {
 		Password:      d.cfg.Password,
 		RenderVersion: render.Version,
 		Fatal:         d.reportAPIFatal,
+		Admission:     d.admission,
 		Log:           d.log,
 	})
 	if err != nil {
@@ -443,13 +472,8 @@ func (d *daemon) startHTTP(ln net.Listener, cancel context.CancelFunc) error {
 	return nil
 }
 
-// reportAPIFatal hands the first fatal database error of an API request to
-// run (§6.4); later ones add nothing.
 func (d *daemon) reportAPIFatal(err error) {
-	select {
-	case d.apiFatal <- err:
-	default:
-	}
+	d.log.Error("fatal failure in an API request, stopping", "code", codeOf(err))
 }
 
 // serveErr is the error of an HTTP server that stopped by itself, if any.
@@ -478,6 +502,10 @@ func (d *daemon) serveErr() error {
 //     nothing can publish any more.
 func (d *daemon) shutdown() error {
 	d.ready.Store(nil)
+	d.admission.Stop()
+	if d.stopCollector != nil {
+		d.stopCollector()
+	}
 	var errs []error
 	if d.api != nil {
 		// §11.1: no mutation is accepted from now on; requests already
@@ -496,11 +524,15 @@ func (d *daemon) shutdown() error {
 	d.log.Info("http server stopped")
 
 	if d.poolDone != nil {
-		if err := <-d.poolDone; err != nil {
+		if err := <-d.poolDone; err != nil && !errors.Is(err, d.admission.Err()) {
 			errs = append(errs, err)
 		}
 		d.log.Info("workers stopped")
 	}
+	if d.collectorDone != nil {
+		<-d.collectorDone
+	}
+	d.admission.Wait()
 	if d.source != nil {
 		if err := d.source.Close(); err != nil {
 			errs = append(errs, err)
@@ -525,7 +557,10 @@ func (d *daemon) shutdown() error {
 // builder and the publisher (§9.3).
 func (d *daemon) buildPublisher() error {
 	var err error
-	if d.blobs, err = blobstore.New(d.vol.Originals(), d.vol.Work()); err != nil {
+	q := store.New(d.pool)
+	if d.blobs, err = blobstore.NewRegistered(d.vol.Originals(), d.vol.Work(), func(ctx context.Context, hash string) (bool, error) {
+		return reclaim.Registered(ctx, q, hash)
+	}); err != nil {
 		return err
 	}
 	d.budget = jobs.NewBudget()
@@ -628,6 +663,7 @@ func (d *daemon) startWorkers(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	d.workers.SetAdmission(d.admission)
 	wctx, cancel := context.WithCancel(ctx)
 	d.stopWorkers, d.poolDone = cancel, make(chan error, 1)
 	go func() { d.poolDone <- d.workers.Run(wctx) }()

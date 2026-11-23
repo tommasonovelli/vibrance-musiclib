@@ -62,6 +62,9 @@ func Backup(ctx context.Context, db *pgxpool.Pool, v *volume.Volume, to, dbURL s
 	if err := RequireCurrentSchema(ctx, db); err != nil {
 		return err
 	}
+	if err := requireNoOriginalRemoval(ctx, db); err != nil {
+		return err
+	}
 	version, err := store.LatestSchemaVersion()
 	if err != nil {
 		return fail(CodeSchema, "cannot read the embedded migrations", err)
@@ -163,7 +166,7 @@ func Backup(ctx context.Context, db *pgxpool.Pool, v *volume.Volume, to, dbURL s
 		}
 		// A lookup, not a zero-value read: a missing zero-size blob must
 		// not pass as present.
-		if n, ok := found[b.Hash]; b.Referenced != nil && *b.Referenced && (!ok || n != b.Size) {
+		if n, ok := found[b.Hash]; b.Referenced && (!ok || n != b.Size) {
 			return fail("backup_blob_missing", "referenced blob is absent: "+b.Hash, nil)
 		}
 	}

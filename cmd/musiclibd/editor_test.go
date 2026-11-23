@@ -405,13 +405,25 @@ func TestEndToEndEditorContent(t *testing.T) {
 	if r := d.mustAPI(t, http.MethodDelete, ed.path+"/tracks/"+ids[0], tag, nil, http.StatusUnprocessableEntity); r.code() != catalog.CodeNoTracks {
 		t.Fatalf("the last track: %v", r.body)
 	}
-	// The removed tracks' originals stay (§4.3: the blob stays), and so
-	// does /import.
+	// The removed tracks leave the original store after the last use.
+	// Their import-source bytes and the remaining track are still intact.
 	for _, n := range []string{"02.mp3", "03.m4a"} {
-		if !exists(t, filepath.Join(p.data, "originals", sum(source[n])[:2], sum(source[n])[2:4], sum(source[n]))) {
-			t.Fatalf("the original of %s went", n)
+		hash := sum(source[n])
+		waitFor(t, "original reclamation of "+n, func() bool {
+			return !exists(t, filepath.Join(p.data, "originals", hash[:2], hash[2:4], hash)) &&
+				queryInt(t, db, `SELECT count(*) FROM blobs WHERE hash=$1`, hash) == 0
+		})
+	}
+	for n, want := range source {
+		got, err := os.ReadFile(filepath.Join(p.imports, "Moanin", n))
+		if err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("source %s: %v", n, err)
 		}
 	}
+	if status, _, got := d.fetch(t, ed.path+"/tracks/"+ids[0]+"/original"); status != http.StatusOK || !bytes.Equal(got, source["01.flac"]) {
+		t.Fatalf("remaining track original: status %d", status)
+	}
+
 	for _, dir := range []string{"render", "retired", "blobs"} {
 		if ents, _ := os.ReadDir(filepath.Join(p.data, "work", dir)); len(ents) != 0 {
 			t.Fatalf("work/%s holds %d entries", dir, len(ents))

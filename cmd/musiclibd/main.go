@@ -35,6 +35,7 @@ import (
 	"musiclib/internal/maintenance"
 	"musiclib/internal/media"
 	"musiclib/internal/publish"
+	"musiclib/internal/reclaim"
 	"musiclib/internal/render"
 	"musiclib/internal/store"
 	"musiclib/internal/volume"
@@ -201,6 +202,7 @@ func codeOf(err error) string {
 		me *media.Error
 		mt *maintenance.Error
 		re *render.Error
+		rm *reclaim.Error
 	)
 	switch {
 	case errors.As(err, &be):
@@ -213,6 +215,8 @@ func codeOf(err error) string {
 		return ve.Code
 	case errors.As(err, &se):
 		return se.Code
+	case errors.As(err, &rm):
+		return reclaim.CodeUnsafe
 	case publish.Code(err) != "":
 		return publish.Code(err)
 	case errors.As(err, &bl):

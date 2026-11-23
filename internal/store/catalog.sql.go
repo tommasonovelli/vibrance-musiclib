@@ -247,17 +247,17 @@ func (q *Queries) DoctorAlbums(ctx context.Context) ([]DoctorAlbumsRow, error) {
 }
 
 const doctorBlobs = `-- name: DoctorBlobs :many
-SELECT b.hash, b.size, EXISTS (
-    SELECT 1 FROM tracks t WHERE t.blob_hash = b.hash OR t.lyrics_hash = b.hash
-) OR EXISTS (SELECT 1 FROM attachments a WHERE a.blob_hash = b.hash)
-  OR EXISTS (SELECT 1 FROM albums al WHERE al.cover_hash = b.hash) AS referenced
-FROM blobs b ORDER BY b.hash
+SELECT b.hash, b.size,
+    EXISTS (SELECT FROM original_references ref WHERE ref.hash = b.hash) AS referenced,
+    (r.generation IS NOT NULL)::boolean AS reclamation_pending
+FROM blobs b LEFT JOIN original_reclamation r USING (hash) ORDER BY b.hash
 `
 
 type DoctorBlobsRow struct {
-	Hash       string
-	Size       int64
-	Referenced *bool
+	Hash               string
+	Size               int64
+	Referenced         bool
+	ReclamationPending bool
 }
 
 // Offline integrity inventory (§11.3). References include trashed albums: their
@@ -272,7 +272,12 @@ func (q *Queries) DoctorBlobs(ctx context.Context) ([]DoctorBlobsRow, error) {
 	var items []DoctorBlobsRow
 	for rows.Next() {
 		var i DoctorBlobsRow
-		if err := rows.Scan(&i.Hash, &i.Size, &i.Referenced); err != nil {
+		if err := rows.Scan(
+			&i.Hash,
+			&i.Size,
+			&i.Referenced,
+			&i.ReclamationPending,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

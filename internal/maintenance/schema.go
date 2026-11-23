@@ -5,6 +5,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"musiclib/internal/reclaim"
 	"musiclib/internal/store"
 )
 
@@ -26,6 +27,17 @@ func RequireCurrentSchema(ctx context.Context, db *pgxpool.Pool) error {
 	}
 	if version != latest {
 		return refuse(CodeSchema, "the database schema is not the current one; start the app once to apply supported migrations")
+	}
+	return nil
+}
+
+func requireNoOriginalRemoval(ctx context.Context, db *pgxpool.Pool) error {
+	hash, err := reclaim.Pending(ctx, store.New(db))
+	if err != nil {
+		return fail(reclaim.CodePending, "cannot check for a pending original removal", err)
+	}
+	if hash != "" {
+		return refuse(reclaim.CodePending, "start the app on a healthy volume to recover removal of original "+hash)
 	}
 	return nil
 }

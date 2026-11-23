@@ -8,7 +8,7 @@ MusicLib keeps your music collection tidy without ever touching your original fi
 2. **Fix the metadata in your browser**: artists, album titles, years, genres, track titles and numbers, covers, lyrics and extra files such as booklets.
 3. **MusicLib writes a clean library folder**: one folder per artist and per album, consistently named files, complete tags and the cover in every track. Any program that reads music folders can use it.
 
-Each edit regenerates only the album it affects, and your original copies are kept forever. MusicLib is a self-hosted web app for one person. It runs in Docker on a Linux machine.
+Each edit regenerates only the album it affects. MusicLib can reclaim its own copy when you remove the last catalog reference to that file. MusicLib is a self-hosted web app for one person. It runs in Docker on a Linux machine.
 
 ![The Library page of MusicLib: a grid of album covers with titles, artists and years, and a sidebar with Library, Import, Activity, Trash and Needs attention](docs/assets/screenshot-library.jpg)
 
@@ -195,7 +195,7 @@ By default only the machine MusicLib runs on can open it; from other devices use
 - import album folders, including multi-disc albums, and report what it imported and what it skipped, and why; create albums and add tracks from the browser, or move tracks to another album;
 - read and write tags of **FLAC**, **MP3** and **M4A** (AAC or ALAC) files;
 - manage **JPEG and PNG covers**, **LRC lyrics** and **extra files** (booklets, scans, logs);
-- let you search the library, move albums to the trash, restore them or empty the trash (the originals stay);
+- let you search the library, move albums to the trash, restore them or empty the trash;
 - verify its work: every copy is checked against the original, and the audio of each track is checked before and after its tags are written;
 - check, back up and restore the whole collection.
 

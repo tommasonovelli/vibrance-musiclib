@@ -18,7 +18,8 @@ func ResetDerivedForRebuild(ctx context.Context, db *pgxpool.Pool) error {
 }
 
 // ResetDerivedForRestore marks source jobs failed in the same catalog
-// transaction as the shared derived-state reset (DESIGN.md §11.4).
+// transaction as the derived-state reset. It starts a new original removal
+// history from the restored catalog references.
 func ResetDerivedForRestore(ctx context.Context, db *pgxpool.Pool) error {
 	return resetDerived(ctx, db, true)
 }
@@ -26,6 +27,12 @@ func ResetDerivedForRestore(ctx context.Context, db *pgxpool.Pool) error {
 func resetDerived(ctx context.Context, db *pgxpool.Pool, restore bool) error {
 	return store.InCatalogTx(ctx, db, func(tx *store.CatalogTx) error {
 		if restore {
+			if err := tx.RestoreClearOriginalReclamation(ctx); err != nil {
+				return dbErr("clearing original eligibility", err)
+			}
+			if err := tx.RestoreSeedOriginalReclamation(ctx); err != nil {
+				return dbErr("seeding original references", err)
+			}
 			if _, err := tx.RestoreFailSourceJobs(ctx); err != nil {
 				return dbErr("failing unfinished source jobs", err)
 			}
