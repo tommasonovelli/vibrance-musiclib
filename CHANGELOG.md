@@ -5,6 +5,8 @@ Versions follow [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-23
+
 ### Added
 
 - **Create album** opens a dedicated page from the sidebar. Pick or drop individual audio files into a local draft, adjust metadata if needed, and optionally add a cover with a local preview. Confirmation fully verifies the audio and saves the complete album at revision 1 with one queued render (`POST /api/albums`). A refused submission leaves no partial catalog entry; originals already received are kept. An uncertain reply can be checked using the same album ID.
@@ -100,7 +102,8 @@ The first release of Vibrance MusicLib: a self-hosted web app, for one person, t
 - **Upgrades are one-way**: a new version can upgrade the database, and an older version refuses it afterwards. Back up before every update: going back to an older version means restoring that backup.
 - **Third-party software**: `ffmpeg` and `ffprobe` in the image are under GPL-2.0-or-later; MusicLib's own code is under the MIT License. `THIRD_PARTY_NOTICES.md` lists every component of the image with its license, and is attached to this release together with the source tarballs of FFmpeg and TagLib.
 
-[Unreleased]: https://github.com/tommasonovelli/vibrance-musiclib/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/tommasonovelli/vibrance-musiclib/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/tommasonovelli/vibrance-musiclib/releases/tag/v1.3.0
 [1.2.0]: https://github.com/tommasonovelli/vibrance-musiclib/releases/tag/v1.2.0
 [1.1.0]: https://github.com/tommasonovelli/vibrance-musiclib/releases/tag/v1.1.0
 [1.0.0]: https://github.com/tommasonovelli/vibrance-musiclib/releases/tag/v1.0.0
